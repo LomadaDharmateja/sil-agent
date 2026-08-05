@@ -31,21 +31,38 @@ from sil_agent.eval import report as report_module
 from sil_agent.eval.harness import ExperimentSpec, execute
 from sil_agent.persistence.db import make_session_factory, resolve_database_url
 from sil_agent.persistence.repo import RunRepository
+from sil_agent.services.replay import CachingRouter
+from sil_agent.services.router import ModelRouter, build_default_router
 from sil_agent.simulators.toy import BENCHMARKS, ToySimulator
 from sil_agent.strategies.base import Strategy
 from sil_agent.strategies.registry import STRATEGY_NAMES
 from sil_agent.strategies.registry import build_strategy as _build_strategy
 
 
-def build_strategy(name: str, *, max_evaluations: int) -> Strategy:
+def build_strategy(
+    name: str,
+    *,
+    max_evaluations: int,
+    run_id: UUID,
+    repo: RunRepository,
+) -> Strategy:
     """Construct a strategy, turning an unknown name into a clean CLI exit.
 
     The budget is passed through because grid search sizes its grid from it.
     On resume it comes from the stored ``BudgetState``, never from the command
     line — see ``strategies/registry.py``.
     """
+
+    def router_factory() -> ModelRouter:
+        return CachingRouter(build_default_router(), repo, run_id)
+
     try:
-        return _build_strategy(name, max_evaluations=max_evaluations)
+        return _build_strategy(
+            name,
+            max_evaluations=max_evaluations,
+            run_id=run_id,
+            router_factory=router_factory,
+        )
     except KeyError as exc:
         raise SystemExit(str(exc.args[0])) from None
 
@@ -101,12 +118,16 @@ def _report(result: LoopResult, repo: RunRepository) -> None:
 
 def command_run(args: argparse.Namespace) -> int:
     simulator = ToySimulator.from_name(args.sim)
-    strategy = build_strategy(args.strategy, max_evaluations=args.episodes)
     repo = build_repository()
+
+    run_id = uuid4()
+    strategy = build_strategy(
+        args.strategy, max_evaluations=args.episodes, run_id=run_id, repo=repo
+    )
 
     now = utcnow()
     state = RunState(
-        run_id=uuid4(),
+        run_id=run_id,
         goal=simulator.default_goal(),
         status=RunStatus.PENDING,
         history=[],
@@ -158,7 +179,12 @@ def command_resume(args: argparse.Namespace) -> int:
     # The budget comes from the stored state, not from a flag. Rebuilding grid
     # search with a different `max_evaluations` would give it a different grid,
     # and the resumed run would stop continuing the original one.
-    strategy = build_strategy(stored.strategy, max_evaluations=state.budget.max_evaluations)
+    strategy = build_strategy(
+        stored.strategy,
+        max_evaluations=state.budget.max_evaluations,
+        run_id=state.run_id,
+        repo=repo,
+    )
 
     print(f"run_id: {state.run_id}", flush=True)
     print(f"simulator: {simulator.name}   strategy: {strategy.name}   seed: {state.seed}")

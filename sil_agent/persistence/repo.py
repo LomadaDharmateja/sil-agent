@@ -33,7 +33,20 @@ from sil_agent.agent.state import (
     RunStatus,
     utcnow,
 )
-from sil_agent.persistence.models import EpisodeRow, RunRow
+from sil_agent.persistence.models import EpisodeRow, LLMCallRow, RunRow
+
+
+class StoredLLMCall(Frozen):
+    """One recorded prompt and reply, read back out of the database."""
+
+    call_key: str
+    role: str
+    provider: str
+    model: str
+    request: dict[str, Any]
+    response: str
+    prompt_tokens: int
+    completion_tokens: int
 
 
 class StoredRun(Frozen):
@@ -158,10 +171,74 @@ class RunRepository:
             session.commit()
             return written is not None
 
+    def record_llm_call(
+        self,
+        run_id: UUID,
+        *,
+        call_key: str,
+        role: str,
+        provider: str,
+        model: str,
+        request: dict[str, Any],
+        response: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        """Store one prompt and its reply. Idempotent on ``(run_id, call_key)``.
+
+        ``DO NOTHING`` rather than an upsert: the first answer to a question is
+        the one the run actually used, and overwriting it would rewrite history
+        that later episodes were built on.
+        """
+        statement = (
+            insert(LLMCallRow)
+            .values(
+                run_id=run_id,
+                call_key=call_key,
+                role=role,
+                provider=provider,
+                model=model,
+                request=request,
+                response=response,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                created_at=utcnow(),
+            )
+            .on_conflict_do_nothing(index_elements=["run_id", "call_key"])
+        )
+        with self._session_factory() as session:
+            session.execute(statement)
+            session.commit()
+
+    def load_llm_call(self, run_id: UUID, call_key: str) -> StoredLLMCall | None:
+        """The stored reply to an identical earlier request, if there is one."""
+        with self._session_factory() as session:
+            row = session.get(LLMCallRow, (run_id, call_key))
+            if row is None:
+                return None
+            return StoredLLMCall(
+                call_key=row.call_key,
+                role=row.role,
+                provider=row.provider,
+                model=row.model,
+                request=row.request,
+                response=row.response,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+            )
+
+    def count_llm_calls(self, run_id: UUID) -> int:
+        with self._session_factory() as session:
+            total = session.execute(
+                select(func.count()).select_from(LLMCallRow).where(LLMCallRow.run_id == run_id)
+            ).scalar_one()
+            return int(total)
+
     def delete_run(self, run_id: UUID) -> None:
-        """Remove a run and its episodes. Used by tests; not exposed on the CLI."""
+        """Remove a run, its episodes and its recorded calls. Tests only."""
         with self._session_factory() as session:
             session.execute(delete(EpisodeRow).where(EpisodeRow.run_id == run_id))
+            session.execute(delete(LLMCallRow).where(LLMCallRow.run_id == run_id))
             session.execute(delete(RunRow).where(RunRow.run_id == run_id))
             session.commit()
 

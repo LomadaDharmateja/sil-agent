@@ -20,9 +20,9 @@ identical sequence" true rather than nearly true.
 from __future__ import annotations
 
 import random
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
-from sil_agent.agent.state import Candidate, Episode, Goal
+from sil_agent.agent.state import Candidate, CostRecord, Episode, Goal
 
 
 class StrategyExhausted(Exception):
@@ -66,3 +66,21 @@ class Strategy(Protocol):
             StrategyExhausted: if there is nothing left to propose.
         """
         ...
+
+
+@runtime_checkable
+class ReportsCost(Protocol):
+    """A strategy that spent money proposing, and can say how much.
+
+    Optional, and separate from ``Strategy`` on purpose: the baselines cost
+    nothing and should not have to implement an accounting method to say so.
+    The loop checks for this at runtime and records zero when it is absent.
+
+    ``last_cost`` describes the call that has just happened. It is written and
+    read within a single episode and never influences a decision, so it is not
+    the hidden state Rule 1 forbids — the next episode is still determined
+    entirely by what is in the database.
+    """
+
+    @property
+    def last_cost(self) -> CostRecord: ...

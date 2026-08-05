@@ -17,6 +17,11 @@ dependencies = [
     "scipy>=1.14",
     "matplotlib>=3.9",
     "numpy>=2.1",
+    # Phase 3. httpx rather than a provider SDK: every provider here is a plain
+    # HTTPS JSON endpoint, and one client for all of them keeps retry, timeout
+    # and error handling in a single place instead of once per vendor library.
+    "httpx>=0.28",
+    "redis>=5.2",
 ]
 
 [project.scripts]

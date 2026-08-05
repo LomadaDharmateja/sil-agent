@@ -231,9 +231,21 @@ class CellStats:
 
     @property
     def label(self) -> str:
-        """`mean ± std` for the table, or an honest marker when there is nothing to average."""
-        if self.mean is None or self.std is None:
+        """`mean ± std` for the table, degrading honestly when there is less to say.
+
+        Three distinct cases, which an earlier version collapsed into one and so
+        reported a successful single-seed run as "no feasible solution":
+
+        * no feasible result anywhere — there is genuinely nothing to report;
+        * exactly one value — a mean exists, a *sample* standard deviation does
+          not (n-1 is zero), so the number is shown with its n rather than with
+          a fabricated ±0;
+        * two or more — mean ± std as usual.
+        """
+        if self.mean is None:
             return "no feasible solution"
+        if self.std is None:
+            return f"{self.mean:.4g} (n=1)"
         return f"{self.mean:.4g} ± {self.std:.2g}"
 
 

@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -65,6 +65,52 @@ class RunRow(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LLMCallRow(Base):
+    """Every prompt sent and every reply received, keyed by run and content.
+
+    Three jobs for one table:
+
+    **Replay.** A completed run can be re-executed with no provider calls at
+    all, which makes debugging an agent free, instant and offline. Without this,
+    investigating a bad run means paying for it again and getting different
+    answers.
+
+    **Evidence.** The prompts and completions behind every published number.
+    A benchmark involving an LLM is only auditable if the model's actual inputs
+    and outputs survive.
+
+    **Statelessness.** `SingleShotLLM` must produce its batch of proposals once
+    but be re-derivable on every episode without holding it in memory. Asking
+    again and hitting this cache satisfies both.
+
+    `call_key` is a hash of (role, system, user), so an identical request within
+    a run is the same row. That is what makes the lookup content-addressed rather
+    than positional — the planner does not have to know it is being cached.
+    """
+
+    __tablename__ = "llm_calls"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    call_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # The full request, so a stored call is reproducible without the code that
+    # built it. Prompts change between versions; this records what was sent.
+    request: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    response: Mapped[str] = mapped_column(Text, nullable=False)
+
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EpisodeRow(Base):

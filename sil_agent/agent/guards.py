@@ -34,8 +34,18 @@ during model validation instead, where the evidence still exists.
 from __future__ import annotations
 
 import math
+import random
+from collections.abc import Sequence
 
-from sil_agent.agent.state import Candidate, Frozen, ParameterSpace, ParamKind, ParamSpec
+from sil_agent.agent.state import (
+    Candidate,
+    CandidateSource,
+    Episode,
+    Frozen,
+    ParameterSpace,
+    ParamKind,
+    ParamSpec,
+)
 
 
 class GuardRejection(Exception):
@@ -161,6 +171,106 @@ def _clean_int(spec: ParamSpec, raw: float | int | str) -> tuple[int, bool, bool
     # Round the bounds inward so clamping can never land outside the range.
     clamped_value = min(max(number, math.ceil(low)), math.floor(high))
     return clamped_value, was_coerced, clamped_value != number
+
+
+def is_duplicate(
+    candidate: Candidate,
+    history: Sequence[Episode],
+    *,
+    tolerance: float = 1e-9,
+) -> bool:
+    """Has this exact parameter set already been evaluated?
+
+    Compared against every previous *evaluation*, not just the most recent one:
+    a planner can oscillate between two points as easily as it can repeat one.
+
+    Floats compare within a tolerance rather than exactly. A model that returns
+    ``3.14159265`` where it previously returned ``3.1415926535`` has proposed
+    the same point, and treating that as new would waste an evaluation on a
+    difference no simulator can resolve.
+    """
+    for episode in history:
+        if episode.sim_result is None:
+            continue
+        if _same_params(candidate.params, episode.candidate.params, tolerance):
+            return True
+    return False
+
+
+def _same_params(
+    left: dict[str, float | int | str],
+    right: dict[str, float | int | str],
+    tolerance: float,
+) -> bool:
+    if set(left) != set(right):
+        return False
+    for name, value in left.items():
+        other = right[name]
+        if isinstance(value, int | float) and isinstance(other, int | float):
+            if abs(float(value) - float(other)) > tolerance:
+                return False
+        elif value != other:
+            return False
+    return True
+
+
+def perturb(
+    candidate: Candidate,
+    space: ParameterSpace,
+    rng: random.Random,
+    *,
+    scale: float = 0.1,
+) -> Candidate:
+    """Nudge a repeated candidate somewhere new. TECHNICAL_DESIGN §3.
+
+    This exists because of a failure that is obvious in hindsight and was not
+    obvious in advance: a planner at temperature 0, shown a history in which one
+    point is the best, proposes that same point again — and then again, with a
+    fluent justification each time ("re-evaluating to confirm robustness"). Left
+    alone it spends an entire budget re-measuring one point.
+
+    Perturbation is the deterministic answer to a model failing to explore. It
+    is not a repair of the model's reasoning — the loop records that the
+    proposal was a duplicate, and ``CandidateSource.PERTURB`` marks the episode,
+    so the rate is visible in the report rather than hidden.
+
+    ``scale`` is a fraction of each parameter's declared range, so the step is
+    meaningful whether a parameter spans [0, 1] or [-5, 10]. Gaussian rather
+    than uniform: most proposals land near the original point, which is usually
+    what is wanted, but the occasional larger jump escapes a local basin.
+    """
+    moved: dict[str, float | int | str] = {}
+
+    for spec in space.params:
+        value = candidate.params.get(spec.name)
+
+        if spec.kind is ParamKind.CATEGORICAL:
+            choices = spec.choices or []
+            alternatives = [c for c in choices if c != value]
+            moved[spec.name] = rng.choice(alternatives) if alternatives else value  # type: ignore[assignment]
+            continue
+
+        assert spec.bounds is not None
+        low, high = spec.bounds
+        span = high - low
+        current = float(value) if isinstance(value, int | float) else (low + high) / 2.0
+        stepped = current + rng.gauss(0.0, scale * span)
+
+        if spec.kind is ParamKind.INT:
+            integer = min(max(round(stepped), math.ceil(low)), math.floor(high))
+            # A rounded step of zero leaves the duplicate in place, which is the
+            # one outcome perturbation must not produce.
+            if integer == value:
+                integer = min(max(integer + rng.choice([-1, 1]), math.ceil(low)), math.floor(high))
+            moved[spec.name] = integer
+        else:
+            moved[spec.name] = min(max(stepped, low), high)
+
+    return Candidate(
+        params=moved,
+        rationale=f"perturbed from a duplicate proposal: {candidate.rationale}"[:500],
+        source=CandidateSource.PERTURB,
+    )
 
 
 def _as_number(spec: ParamSpec, raw: float | int | str) -> tuple[float | int, bool]:

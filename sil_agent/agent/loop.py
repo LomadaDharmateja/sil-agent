@@ -33,15 +33,18 @@ import os
 import random
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from sil_agent.agent.guards import GuardRejection, validate
+from sil_agent.agent.guards import GuardRejection, is_duplicate, perturb, validate
+from sil_agent.agent.stagnation import StagnationDetector, check_all
 from sil_agent.agent.state import (
     Best,
     BudgetState,
+    Candidate,
+    CandidateSource,
     CostRecord,
     Episode,
     Evaluation,
@@ -54,8 +57,9 @@ from sil_agent.agent.state import (
     TerminationReason,
     ToolError,
 )
+from sil_agent.services.retry import ProviderError
 from sil_agent.simulators.base import Simulator
-from sil_agent.strategies.base import Strategy, StrategyExhausted
+from sil_agent.strategies.base import ReportsCost, Strategy, StrategyExhausted
 
 
 def episode_rng(seed: int, idx: int) -> random.Random:
@@ -70,6 +74,17 @@ def episode_rng(seed: int, idx: int) -> random.Random:
     across runs (seed 1 episode 2 and seed 2 episode 1 would share a stream).
     """
     return random.Random(f"{seed}:{idx}")
+
+
+def perturb_rng(seed: int, idx: int) -> random.Random:
+    """A separate deterministic stream for perturbation.
+
+    Distinct from ``episode_rng`` so that nudging a duplicate cannot consume
+    draws a strategy was going to use, which would make perturbation change the
+    *next* proposal as a side effect. Both are derived from persisted values, so
+    Rule 1 holds either way.
+    """
+    return random.Random(f"{seed}:{idx}:perturb")
 
 
 def recompute_step_idx(history: list[Episode]) -> int:
@@ -188,6 +203,8 @@ class LoopResult:
     state: RunState
     reason: TerminationReason
     episodes_run: int
+    # Which detector fired, when the reason is STAGNATION. Empty otherwise.
+    detail: str = ""
 
 
 # Called after each episode is durably written. Used by the CLI to print
@@ -203,6 +220,7 @@ def run_loop(
     repo: RunRepositoryProtocol,
     on_episode: EpisodeCallback | None = None,
     crash_at: int | None = None,
+    detectors: Sequence[StagnationDetector] | None = None,
 ) -> LoopResult:
     """Run episodes until a termination condition fires.
 
@@ -218,6 +236,7 @@ def run_loop(
     state = rehydrate(state)
     goal = state.goal
     episodes_run = 0
+    stagnation_detail = ""
 
     while True:
         budget = state.budget
@@ -243,8 +262,22 @@ def run_loop(
             reason = TerminationReason.SUCCESS
             break
 
+        # The third independent exit (TECHNICAL_DESIGN §3). Off by default so
+        # the Phase 2 baselines are unaffected: random search legitimately goes
+        # long stretches without improving, and terminating it early would
+        # change the numbers the whole comparison rests on.
+        if detectors:
+            verdict = check_all(detectors, state.history, goal)
+            if verdict.stuck:
+                stagnation_detail = verdict.detail
+                reason = TerminationReason.STAGNATION
+                break
+
         idx = state.step_idx
         started = time.perf_counter()
+
+        outcome: SimResult | ToolError
+        proposal_failed: ToolError | None = None
 
         try:
             candidate = strategy.propose(goal, state.history, episode_rng(state.seed, idx))
@@ -253,19 +286,53 @@ def run_loop(
             # not the same thing as running out of budget.
             reason = TerminationReason.EXHAUSTED
             break
+        except ProviderError as exc:
+            # From Phase 3 the proposer is an LLM, and it can fail to produce
+            # anything usable: unparseable output, a schema it will not satisfy,
+            # or every provider exhausted. That is an ordinary event, not a
+            # crash. It is recorded as a failed episode so the history shows what
+            # happened, and it counts against the rejection allowance so a
+            # permanently broken provider ends the run instead of looping.
+            #
+            # A placeholder candidate is stored because an Episode needs one and
+            # there genuinely is not a proposal. Empty params say exactly that.
+            candidate = Candidate(
+                params={},
+                rationale="the planner produced no usable proposal",
+                source=CandidateSource.PLANNER,
+            )
+            proposal_failed = ToolError(
+                kind=type(exc).__name__, message=str(exc), retryable=True
+            )
 
         # The guard runs before the simulator, always. In Phase 1 the proposer
-        # is a uniform sampler that cannot produce an invalid candidate; from
-        # Phase 3 it is an LLM that can, and this line is unchanged.
-        outcome: SimResult | ToolError
-        try:
-            guarded = validate(candidate, goal.parameter_space)
-            candidate = guarded.candidate
-            outcome = simulator.run(candidate.params)
-        except GuardRejection as exc:
-            outcome = ToolError(kind="GuardRejection", message=exc.reason)
-        except Exception as exc:  # a broken simulator must not lose the run
-            outcome = ToolError(kind=type(exc).__name__, message=str(exc), retryable=True)
+        # was a uniform sampler that could not produce an invalid candidate;
+        # from Phase 3 it is an LLM that can, and these lines are unchanged.
+        if proposal_failed is not None:
+            outcome = proposal_failed
+        else:
+            try:
+                guarded = validate(candidate, goal.parameter_space)
+                candidate = guarded.candidate
+
+                # TECHNICAL_DESIGN §3. A planner shown a history with one good
+                # point will propose that same point again, with a fluent
+                # justification each time, and spend a whole budget re-measuring
+                # it. Perturbation is the deterministic answer to a model that
+                # will not explore. The episode is marked PERTURB so the rate is
+                # visible in the report rather than hidden.
+                if is_duplicate(candidate, state.history):
+                    candidate = perturb(
+                        candidate,
+                        goal.parameter_space,
+                        perturb_rng(state.seed, idx),
+                    )
+
+                outcome = simulator.run(candidate.params)
+            except GuardRejection as exc:
+                outcome = ToolError(kind="GuardRejection", message=exc.reason)
+            except Exception as exc:  # a broken simulator must not lose the run
+                outcome = ToolError(kind=type(exc).__name__, message=str(exc), retryable=True)
 
         # improved / delta / feasible are COMPUTED here, from oracle output.
         # From Phase 4 they are passed into the critic, which explains them but
@@ -277,6 +344,12 @@ def run_loop(
         else:
             improved, delta, feasible = False, 0.0, False
 
+        # What the proposal cost. Zero for the baselines, which do not implement
+        # the optional protocol; real tokens for an LLM strategy. Read after
+        # propose() so a rejected or failed proposal is still charged — the call
+        # was paid for whether or not it produced anything usable.
+        cost = strategy.last_cost if isinstance(strategy, ReportsCost) else CostRecord.zero()
+
         episode = Episode(
             idx=idx,
             candidate=candidate,
@@ -285,7 +358,7 @@ def run_loop(
                 improved=improved, delta_vs_best=delta, feasible=feasible
             ),
             decision=ReplanDecision.placeholder(),
-            cost=CostRecord.zero(),
+            cost=cost,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
 
@@ -333,4 +406,9 @@ def run_loop(
     state = state.with_status(final_status)
     repo.save_run(state, simulator=simulator.name, strategy=strategy.name)
 
-    return LoopResult(state=state, reason=reason, episodes_run=episodes_run)
+    return LoopResult(
+        state=state,
+        reason=reason,
+        episodes_run=episodes_run,
+        detail=stagnation_detail,
+    )

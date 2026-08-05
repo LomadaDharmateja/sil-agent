@@ -24,7 +24,7 @@ Under construction. See `docs/phases/` for the build log.
 |---|---|
 | 1 — State, persistence, toy simulator | **done** — [log](docs/phases/phase-01.md) |
 | 2 — Baselines and eval harness | **done** — [log](docs/phases/phase-02.md) · [report](reports/phase2-main/report.md) |
-| 3 — Agent loop, planner only | not started |
+| 3 — Agent loop, planner only | **done** — [log](docs/phases/phase-03.md) · [report](reports/phase3-main/report.md) |
 | 4 — Critic and replanner | not started |
 | 5 — Episodic memory | not started |
 | 6 — Budget, tracing, MCP, API | not started |
@@ -57,6 +57,35 @@ python -m sil_agent.cli report --experiment phase2-main --noise-experiment phase
 
 Re-running `ablate` with the same arguments continues an interrupted matrix — run
 identity is derived from the configuration, so there is no resume flag to remember.
+
+## How the agent is kept honest
+
+The LLM is fenced in by deterministic code at every point where it could quietly
+corrupt a result:
+
+| Boundary | What it does |
+|---|---|
+| **`services/router.py`** | The only door to a provider. Model output becomes an object solely by surviving `json.loads` and Pydantic validation — one repair attempt, then a recorded failure. |
+| **`agent/guards.py`** | A proposed parameter is checked against the space the *simulator* declares. Invented names are rejected, out-of-bounds values clamped and the clamp recorded. |
+| **Duplicate detection** | A planner shown a good result will re-propose it indefinitely, with a fluent justification each time. Repeats are perturbed deterministically and marked `PERTURB` so the rate stays visible. |
+| **Budget accounting** | Rejections are counted and capped separately from evaluations, so a hallucinating planner still gets the same number of *simulator calls* as a well-behaved one. |
+| **`llm_calls` table** | Every prompt and reply is stored, so a run replays offline and the evidence behind every published number survives. |
+
+Rate limiting never reaches agent code: the router paces calls to the provider's
+limit and retries 429s with jittered backoff.
+
+### The result Phase 3 does not claim
+
+On Branin at 15 evaluations both LLM strategies reach the global optimum while
+TPE sits at regret 4.9 — a seven-order-of-magnitude win that **should not be
+believed.** The single-shot control proposed all three of Branin's global minima
+to four decimal places *before seeing any result*: the model has memorised the
+benchmark, so the comparison measures recall rather than search.
+
+Catching that is what the control was for. It also promotes Phase 9's bespoke
+vehicle simulator from "domain credibility" to a methodological requirement —
+a function with no published optimum is the only way to measure whether the agent
+can actually reason. Details in the [Phase 3 log](docs/phases/phase-03.md).
 
 ## Documentation
 

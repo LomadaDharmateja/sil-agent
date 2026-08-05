@@ -286,6 +286,21 @@ def test_cell_reports_missing_rather_than_averaging_around_it():
     assert cell.mean == pytest.approx(1.0)
 
 
+def test_a_single_seed_cell_reports_its_value_not_an_absence():
+    """A regression test for a report that called every successful run a failure.
+
+    With one seed there is a mean but no *sample* standard deviation, and the
+    label used to treat a missing std as missing data — so a 15-evaluation run
+    that found the global optimum was printed as "no feasible solution".
+    """
+    summaries = [summarise_run(stored([episode(0, 1.397887)], max_evaluations=1), BRANIN)]
+    cell = summarise_cell(summaries)
+
+    assert cell.mean == pytest.approx(1.0)
+    assert cell.std is None, "a sample std needs at least two observations"
+    assert cell.label == "1 (n=1)"
+
+
 def test_cell_label_is_honest_when_nothing_was_feasible():
     summaries = [
         summarise_run(

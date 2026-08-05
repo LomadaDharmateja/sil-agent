@@ -34,7 +34,7 @@ behaviour: they are different experiments and their runs must not be pooled.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from uuid import UUID, uuid5
 
@@ -42,6 +42,8 @@ from sil_agent.agent.loop import LoopResult, rehydrate, run_loop
 from sil_agent.agent.state import BudgetState, RunState, RunStatus, utcnow
 from sil_agent.eval.metrics import derive_termination
 from sil_agent.persistence.repo import RunRepository
+from sil_agent.services.replay import CachingRouter
+from sil_agent.services.router import ModelRouter, build_default_router
 from sil_agent.simulators.toy import ToySimulator
 from sil_agent.strategies.registry import build_strategy
 
@@ -120,6 +122,20 @@ class ExperimentSpec:
         return len(self.strategies) * len(self.simulators) * len(self.seeds)
 
 
+def _router_factory(run_id: UUID, repo: RunRepository) -> Callable[[], ModelRouter]:
+    """A router that records every call against this run and replays repeats.
+
+    Returned as a factory rather than a router so that nothing is constructed —
+    and no API key is needed — unless a strategy actually asks for one. A matrix
+    of baselines runs on a machine with no key configured.
+    """
+
+    def build() -> ModelRouter:
+        return CachingRouter(build_default_router(), repo, run_id)
+
+    return build
+
+
 @dataclass(frozen=True)
 class CellOutcome:
     """What happened to one cell during this invocation."""
@@ -182,7 +198,15 @@ def execute_cell(cell: Cell, spec: ExperimentSpec, repo: RunRepository) -> CellO
     # resume, the persisted value is the authority. They agree unless the spec
     # was edited between invocations, in which case the run's own budget — the
     # one its grid and its history were built against — is the correct one.
-    strategy = build_strategy(cell.strategy, max_evaluations=state.budget.max_evaluations)
+    strategy = build_strategy(
+        cell.strategy,
+        max_evaluations=state.budget.max_evaluations,
+        run_id=cell.run_id,
+        # Every model call is recorded against this run and replayed on a second
+        # invocation, so re-running a finished matrix costs nothing and a
+        # resumed run reuses the answers it already paid for.
+        router_factory=_router_factory(cell.run_id, repo),
+    )
 
     result = run_loop(state=state, simulator=simulator, strategy=strategy, repo=repo)
 

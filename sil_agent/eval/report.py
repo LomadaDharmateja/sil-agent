@@ -519,11 +519,28 @@ def build(
         "",
         headline_table(cells, strategies, simulators),
         "",
-        "Grid search shows a standard deviation of exactly zero because it does not",
-        "consume the seed: its points are fixed by the parameter space and the budget,",
-        "so every seed produces the identical run. That is a property of the strategy,",
-        "not a suspiciously clean measurement.",
-        "",
+    ]
+
+    # Only worth explaining when it is actually on the page. With a single seed
+    # per cell there is no standard deviation to be suspicious of.
+    if any(_has_no_variance(cell) for cell in cells.values()):
+        sections += [
+            "A standard deviation of exactly zero belongs to a deterministic strategy —",
+            "grid search does not consume the seed, so every seed produces the identical",
+            "run. That is a property of the strategy, not a suspiciously clean",
+            "measurement.",
+            "",
+        ]
+
+    if any(cell.n == 1 for cell in cells.values()):
+        sections += [
+            "`(n=1)` marks a cell with a single seed: a mean exists, a sample standard",
+            "deviation does not. Those cells show what happened once and support no",
+            "claim about what happens on average.",
+            "",
+        ]
+
+    sections += [
         "## Budget actually used, and why each run stopped",
         "",
         budget_table(cells, strategies, simulators),

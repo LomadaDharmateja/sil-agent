@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sil_agent_postgres
+    environment:
+      POSTGRES_USER: sil
+      POSTGRES_PASSWORD: sil
+      POSTGRES_DB: sil_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once on first boot of an empty volume — creates the test database
+      # so pytest never touches the development one.
+      - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sil -d sil_agent"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Present for Phase 3+ (run locks, queue). No Phase 1 code touches it.
+  redis:
+    image: redis:7-alpine
+    container_name: sil_agent_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

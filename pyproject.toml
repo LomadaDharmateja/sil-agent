@@ -1,0 +1,99 @@
+[project]
+name = "sil-agent"
+version = "0.1.0"
+description = "Simulation In the Loop — an LLM agent that optimises engineering designs against a simulator"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.14",
+    "python-dotenv>=1.0",
+    # Phase 2. Optuna supplies the TPE baseline; scipy the rank test; matplotlib
+    # the convergence plots. numpy arrives as a transitive dependency of all
+    # three and is used directly by eval/metrics.py.
+    "optuna>=4.1",
+    "scipy>=1.14",
+    "matplotlib>=3.9",
+    "numpy>=2.1",
+]
+
+[project.scripts]
+sil-agent = "sil_agent.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    # Type stubs. scipy ships no inline types, so without these mypy cannot
+    # check any call into it — and `strict` refuses to import it silently.
+    "scipy-stubs>=1.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sil_agent"]
+
+# ---------------------------------------------------------------------------
+# ruff — linter and formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Ruff formats Python code blocks inside Markdown. The design documents use
+# hand-aligned columns in their schema sketches for readability, and reformatting
+# them silently rewrites the specification this project is built against.
+extend-exclude = ["*.md"]
+# Apply the exclusion even when a path is passed explicitly, so that
+# `ruff format docs/TECHNICAL_DESIGN.md` is a no-op rather than a rewrite.
+force-exclude = true
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade — modern syntax
+    "B",    # bugbear — likely bugs
+    "SIM",  # simplifications
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic generates these files; its own conventions differ from ours.
+"sil_agent/persistence/migrations/*" = ["E501"]
+
+# ---------------------------------------------------------------------------
+# mypy — static type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+# Tests deliberately pass bad values to guards; full strictness there is noise.
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "db: test requires a reachable Postgres (TEST_DATABASE_URL)",
+]
+# pytest installs its own warning filters around every test, which overrides the
+# one `strategies/optuna_tpe.py` sets at import. The filter has to be repeated
+# here to keep it in force under pytest. Kept as narrow as the original: this
+# one experimental API, not experimental warnings in general.
+filterwarnings = [
+    "ignore:.*constraints_func.*is an experimental feature.*",
+]

@@ -1,0 +1,30 @@
+# Line endings, settled here rather than per machine.
+#
+# Without this file, how a checkout looks depends on each developer's
+# `core.autocrlf` setting. This machine has it on, so the repository already
+# holds LF and only the working copy is CRLF — but a contributor or a CI runner
+# with a different setting would start committing CRLF, and the diff would show
+# every line of a file as changed when nothing had.
+#
+# `text=auto` lets git decide what is text; `eol=lf` fixes what text looks like
+# in the repository. Windows editors handle LF fine, and Phase 6's CI runs on
+# Linux.
+* text=auto eol=lf
+
+# Binary. Never normalised, never diffed as text — the convergence plots in
+# reports/ are the immediate case.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+
+# Resolver output, not hand-written. Marking it generated collapses it by
+# default in GitHub diffs and keeps it out of the language statistics, so a
+# 1,274-line lockfile does not drown a review.
+uv.lock linguist-generated=true
+
+# Documentation is the substance of this project, not an afterthought — count
+# it in the language statistics rather than hiding it.
+docs/**/*.md linguist-documentation=false

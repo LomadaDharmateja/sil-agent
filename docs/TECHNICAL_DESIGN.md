@@ -201,30 +201,67 @@ episodes (run_id FK, idx, candidate JSONB, result JSONB,
 
 ---
 
-## 5. LLM providers — free first, paid only for final numbers
+## 5. LLM providers — local primary, paid only for the scaling result
 
-Your instinct here is correct and the free tiers are more than sufficient. As of 2026:
+**Revised after Phase 3. The original version of this section was wrong** — it cited free-tier allowances from third-party aggregators that did not survive contact with reality.
 
-| Provider | Free allowance | Best for |
+Measured, not quoted:
+
+| Provider | What was actually observed |
+|---|---|
+| **Cerebras** | HTTP 402 on every model. No usable free quota. |
+| **Google Gemini** | `GenerateRequestsPerDayPerProjectPerModel-FreeTier = 20`. Twenty requests per day per model — roughly 50× less than the aggregators claimed. |
+| **Groq** | Untested. Worth a key as a middle tier; do not let a headline depend on it. |
+
+Phase 4 needs roughly 2,700 calls. At 20/day that is 135 days. Free API tiers cannot carry this project.
+
+### Local is the primary, for a better reason than cost
+
+A pinned local model reruns **byte-identically in two years**. No hosted API can promise that — providers update models silently and without notice, and when that happens previously published numbers stop being reproducible. For a project whose entire claim is honest measurement, that is a methodological advantage, not a consolation prize.
+
+**Target hardware: RTX 3050 Ti Laptop, 4 GB VRAM, 16 GB system RAM.** VRAM is the binding constraint.
+
+| Model | Size at Q4_K_M | Fits 4 GB VRAM? |
 |---|---|---|
-| **Cerebras** | ~1M tokens/day, no card | Highest raw daily volume — the development workhorse |
-| **Google Gemini** | Flash-Lite 1,000 req/day at 15 RPM; Flash 250/day at 10 RPM | Long context, reliable structured output |
-| **Groq** | Generous free tier | Llama 3.3 70B, Qwen3-32B, gpt-oss — very fast (~320 tok/s) |
-| **NVIDIA NIM** (build.nvidia.com) | Permanent free tier | Wide model catalogue including Qwen variants |
-| **OpenRouter** | ~28 free models, 50 req/day (1,000/day after a one-time $10) | DeepSeek R1, Qwen3 Coder, Llama 3.3 |
+| **Qwen3-4B** | ~2.5 GB | **Yes**, with headroom for KV cache |
+| Qwen3-8B | ~4.7 GB | No — forces CPU offload, roughly 3× slower |
 
-**Rough budget arithmetic.** One episode ≈ 3 LLM calls. A 50-episode run ≈ 150 calls. Gemini Flash-Lite alone gives ~6 full runs per day free; stack Cerebras and Groq alongside and development is effectively unconstrained.
+**Use `qwen3:4b-q4_K_M`.** Pin the full tag including quantisation. A bare `qwen3` tag silently changes underneath you and destroys the reproducibility this switch exists to obtain.
 
-**Strategy:**
+Qwen3-4B is also the Phase 10 distillation target, so the model used from Phase 3.5 onward is the same one that later gets fine-tuned on frontier-model traces. One story, not two.
 
-1. **Phases 1–8** — free tiers only. Zero spend.
-2. **Final benchmark runs** — paid frontier models for the numbers that go in the blog post and on the CV. Budget €30–80.
-3. **Optional local** — Ollama with Qwen3 for fully offline development.
+### Structured output — the real risk at 4B
 
-Two design consequences worth noting, both already handled:
+Small models are materially worse at returning schema-valid JSON. Mitigations, in order:
 
-- The `ModelRouter` abstraction means switching or stacking providers is a config change, never a code change. This is precisely why it exists.
-- Free tiers rate-limit at 10–15 RPM, and an agent loop will hit that constantly. **Retry with jittered exponential backoff on HTTP 429 is mandatory, not optional.** Build it in Phase 3 or you'll fight it forever.
+1. **Use Ollama's `format` parameter with a JSON schema.** This performs constrained decoding against a grammar — the model physically cannot emit invalid JSON. Do not rely on asking politely in the prompt.
+2. **Measure and report the schema-compliance rate.** It belongs in the report as a number. A weakness that is measured is a result; a weakness that is hidden is a liability.
+3. The router's existing one-repair-then-record-failure path stays as the backstop.
+
+### Verify the GPU is actually being used
+
+`ollama ps` shows whether a model is resident on GPU or CPU. A silent CPU fallback turns a four-hour overnight run into a multi-day one. Check once, at the start.
+
+### The two published results
+
+| Result | Model | Purpose |
+|---|---|---|
+| **Full ablation** | Pinned `qwen3:4b-q4_K_M` | The headline. Reproducible indefinitely. |
+| **Reduced comparison** | Frontier model, paid | Does reflection help more or less as the model gets stronger? |
+
+The second is a genuine research question, not a formality. Budget €30–80, spent once, only after the local pipeline is fully working.
+
+### Realistic Phase 4 scope
+
+3 LLM strategies × 5 seeds × 2 benchmarks × 20 evaluations × 3 calls ≈ **1,800 calls ≈ 4 hours** on the target hardware. An overnight run.
+
+Five seeds is non-negotiable — Phase 2 measured the seed noise floor at ~102% of the mean. **Prefer fewer benchmarks at five seeds over more benchmarks at one.** A single-seed result is not interpretable and this project has already proven that.
+
+### Design consequences
+
+- The `ModelRouter` abstraction means provider choice is a config change, never a code change. This is precisely why it exists.
+- Hosted free tiers rate-limit hard, and an agent loop hits that constantly. **Retry with jittered exponential backoff on HTTP 429 is mandatory.** Already built in Phase 3.
+- Keep the Gemini adapter. Cross-provider failover is portfolio content in its own right.
 
 ```python
 class ModelRouter(Protocol):

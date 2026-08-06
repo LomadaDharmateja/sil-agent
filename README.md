@@ -25,6 +25,7 @@ Under construction. See `docs/phases/` for the build log.
 | 1 — State, persistence, toy simulator | **done** — [log](docs/phases/phase-01.md) |
 | 2 — Baselines and eval harness | **done** — [log](docs/phases/phase-02.md) · [report](reports/phase2-main/report.md) |
 | 3 — Agent loop, planner only | **done** — [log](docs/phases/phase-03.md) · [report](reports/phase3-main/report.md) |
+| 3.5 — Memorisation fix, local provider | **done** — [log](docs/phases/phase-035.md) · [report](reports/phase35-main/report.md) |
 | 4 — Critic and replanner | not started |
 | 5 — Episodic memory | not started |
 | 6 — Budget, tracing, MCP, API | not started |
@@ -70,22 +71,41 @@ corrupt a result:
 | **Duplicate detection** | A planner shown a good result will re-propose it indefinitely, with a fluent justification each time. Repeats are perturbed deterministically and marked `PERTURB` so the rate stays visible. |
 | **Budget accounting** | Rejections are counted and capped separately from evaluations, so a hallucinating planner still gets the same number of *simulator calls* as a well-behaved one. |
 | **`llm_calls` table** | Every prompt and reply is stored, so a run replays offline and the evidence behind every published number survives. |
+| **Shifted instances** | Benchmarks are re-posed on a seeded rotation of themselves, so a model that memorised the textbook cannot recall the answer. A test asserts nothing in the prompt names the function. |
 
 Rate limiting never reaches agent code: the router paces calls to the provider's
 limit and retries 429s with jittered backoff.
 
-### The result Phase 3 does not claim
+### The result Phase 3 did not claim, and what replaced it
 
-On Branin at 15 evaluations both LLM strategies reach the global optimum while
-TPE sits at regret 4.9 — a seven-order-of-magnitude win that **should not be
+On Branin at 15 evaluations both LLM strategies reached the global optimum while
+TPE sat at regret 4.9 — a seven-order-of-magnitude win that **should not have been
 believed.** The single-shot control proposed all three of Branin's global minima
-to four decimal places *before seeing any result*: the model has memorised the
-benchmark, so the comparison measures recall rather than search.
+to four decimal places *before seeing any result*: the model had memorised the
+benchmark, so the comparison measured recall rather than search.
 
-Catching that is what the control was for. It also promotes Phase 9's bespoke
-vehicle simulator from "domain credibility" to a methodological requirement —
-a function with no published optimum is the only way to measure whether the agent
-can actually reason. Details in the [Phase 3 log](docs/phases/phase-03.md).
+Phase 3.5 fixed the measurement. Every benchmark is now also published as a
+**shifted and rotated instance** — `f'(z) = f(R(z − s))`, seeded, posed on the
+unit cube with the optimal *value* preserved so regret stays reportable — and
+nothing in the prompt names the function. On those instances the same control
+opens with the four corners and the centre of the unit square instead of the
+published minima. It is searching, not reciting.
+
+The comparison that replaces it, on a **local 4B model** at 20 evaluations:
+
+| Strategy | branin_i1 | hartmann6_i1 |
+|---|---|---|
+| **agent_no_reflection** | **0.381 ± 0.23** | **1.052 ± 0.56** |
+| optuna_tpe | 2.838 ± 2.5 | 1.540 ± 0.64 |
+| single_shot_llm | 4.236 ± 2.5 | 2.347 ± 0.58 |
+| random_search | 4.689 ± 3.4 | 1.684 ± 0.78 |
+
+The agent and its no-loop control have **separated** — in Phase 3 they were
+identical, because memorisation had saturated both. That gap is the loop.
+
+What the numbers do *not* say is equally on the record: on `hartmann6_i1` the
+lead over TPE is inside the measured seed noise floor, so no claim is made there.
+Details in the [Phase 3.5 log](docs/phases/phase-035.md).
 
 ## Documentation
 
@@ -97,4 +117,8 @@ can actually reason. Details in the [Phase 3 log](docs/phases/phase-03.md).
 
 ## Stack
 
-Python 3.12 · Pydantic v2 · Postgres · Redis · FastAPI · Optuna · OpenTelemetry · Langfuse · Docker
+Python 3.12 · Pydantic v2 · Postgres · Redis · FastAPI · Optuna · Ollama · OpenTelemetry · Langfuse · Docker
+
+The agent runs on a **local** `qwen3:4b-q4_K_M` through Ollama — no API key, no
+quota, and a pinned model that reruns byte-identically in two years, which no
+hosted API can promise. Hosted providers remain wired in as failover.

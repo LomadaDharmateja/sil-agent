@@ -45,13 +45,38 @@ from sil_agent.simulators.toy import BENCHMARKS
 # Chart styling
 # ---------------------------------------------------------------------------
 #
-# Colours are the first three slots of a categorical palette validated for
-# colour-vision deficiency: worst all-pairs CVD separation ΔE 9.2, worst
-# normal-vision separation ΔE 24.0. Assigned to strategies in a fixed order and
-# never cycled, so a strategy keeps its colour across every plot in the report —
-# a reader who learns "orange is grid search" on one chart is not re-taught on
-# the next.
-SERIES_COLOURS: list[str] = ["#2a78d6", "#eb6834", "#1baf7a"]
+# A categorical palette validated for colour-vision deficiency, not chosen by
+# eye. Six slots, because Phase 3.5 plots five strategies and Phase 4 adds a
+# sixth. Measured: worst adjacent CVD separation ΔE 9.2 (deutan) / 7.8 (tritan),
+# worst normal-vision separation ΔE 22.6, all six inside the lightness band and
+# above the chroma floor.
+#
+# Phase 3 shipped three of these and *cycled* them. With five strategies that
+# painted `agent_no_reflection` and `random_search` the same blue and
+# `grid_search` and `single_shot_llm` the same orange — two lines meaning
+# different things in one colour, which is worse than no chart at all. Hence
+# `colour_for` now refuses rather than wraps.
+SERIES_COLOURS: list[str] = [
+    "#2a78d6",  # blue
+    "#eb6834",  # vermillion
+    "#1baf7a",  # green
+    "#8c5ac8",  # purple
+    "#a37b00",  # olive
+    "#c2529a",  # magenta
+]
+
+# Redundant encoding, so identity never rests on hue alone. The tritan
+# separation above sits in the 6-8 "floor" band, which is only legal alongside a
+# secondary channel — these line styles and the direct end labels are it. It
+# also rescues the case colour cannot: two medians that overlap exactly.
+SERIES_LINESTYLES: list[tuple[int, tuple[int, ...]]] = [
+    (0, ()),           # solid
+    (0, (6, 2)),       # dashed
+    (0, (1, 2)),       # dotted
+    (0, (6, 2, 1, 2)), # dash-dot
+    (0, (3, 2)),       # short dash
+    (0, (1, 1)),       # dense dot
+]
 
 SURFACE = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
@@ -73,16 +98,36 @@ class Report:
     plots: tuple[Path, ...]
 
 
-def colour_for(strategy: str, order: Sequence[str]) -> str:
-    """A strategy's fixed colour slot.
+def _slot_for(strategy: str, order: Sequence[str]) -> int:
+    """A strategy's fixed slot, or a refusal.
 
-    Beyond the third strategy the palette stops being CVD-safe for all pairs.
-    Phase 4 will have six strategies, at which point this needs facetting into
-    small multiples rather than a fourth hue — flagged here rather than
-    discovered then.
+    Fixed rather than cycled: a strategy keeps its colour across every plot in
+    the report, so a reader who learns "vermillion is grid search" on one chart
+    is not re-taught on the next.
+
+    Past the end of the palette this raises instead of wrapping. A seventh
+    series is not a generated hue — it needs small multiples, or the series
+    folded together — and failing here is how that decision gets made
+    deliberately rather than discovered in a chart with two identical blue
+    lines.
     """
     index = list(order).index(strategy)
-    return SERIES_COLOURS[index % len(SERIES_COLOURS)]
+    if index >= len(SERIES_COLOURS):
+        raise ValueError(
+            f"{len(order)} strategies exceeds the {len(SERIES_COLOURS)}-slot validated "
+            "palette. Adding a hue would break the CVD guarantee; facet into small "
+            "multiples instead."
+        )
+    return index
+
+
+def colour_for(strategy: str, order: Sequence[str]) -> str:
+    return SERIES_COLOURS[_slot_for(strategy, order)]
+
+
+def linestyle_for(strategy: str, order: Sequence[str]) -> tuple[int, tuple[int, ...]]:
+    """The redundant channel. See SERIES_LINESTYLES."""
+    return SERIES_LINESTYLES[_slot_for(strategy, order)]
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +218,14 @@ def convergence_plot(
             highs.append(max(_percentile(values, 75.0), LOG_FLOOR))
 
         axes.fill_between(x_values, lows, highs, color=colour, alpha=0.15, linewidth=0)
-        axes.plot(x_values, medians, color=colour, linewidth=2.0, label=strategy)
+        axes.plot(
+            x_values,
+            medians,
+            color=colour,
+            linewidth=2.0,
+            linestyle=linestyle_for(strategy, strategies),
+            label=strategy,
+        )
 
         last = _last_finite(medians)
         if last is not None:
@@ -427,6 +479,47 @@ def noise_table(floors: Sequence[NoiseFloor]) -> str:
     return "\n".join(lines)
 
 
+def compliance_table(summaries: Sequence[RunSummary]) -> str:
+    """Structured-output quality per LLM strategy.
+
+    `TECHNICAL_DESIGN.md` §5 requires this as a reported number rather than a
+    footnote: small models are materially worse at returning schema-valid JSON,
+    and *"a weakness that is measured is a result; a weakness that is hidden is
+    a liability."*
+
+    Note what is being counted. Constrained decoding guarantees the reply parses
+    as JSON, so "fraction that parsed" would read 100% by construction and mean
+    nothing. This counts replies the caller's Pydantic schema accepted **on the
+    first attempt**, with calls that never complied at all included in the
+    denominator.
+    """
+    by_strategy: dict[str, list[RunSummary]] = {}
+    for summary in summaries:
+        if summary.model_calls or summary.schema_failures:
+            by_strategy.setdefault(summary.strategy, []).append(summary)
+
+    if not by_strategy:
+        return ""
+
+    lines = [
+        "| Strategy | Model calls | Valid first try | Needed repair | Never valid | Compliance |",
+        "|---|---|---|---|---|---|",
+    ]
+    for strategy in sorted(by_strategy):
+        runs = by_strategy[strategy]
+        calls = sum(r.model_calls for r in runs)
+        compliant = sum(r.compliant_calls for r in runs)
+        failures = sum(r.schema_failures for r in runs)
+        total = calls + failures
+        rate = f"{compliant / total:.1%}" if total else "—"
+        lines.append(
+            f"| {strategy} | {calls} | {compliant} | {calls - compliant} | "
+            f"{failures} | {rate} |"
+        )
+
+    return "\n".join(lines)
+
+
 def per_seed_table(summaries: Sequence[RunSummary]) -> str:
     """Every raw number. The answer to "are you sure you didn't pick a good seed?"."""
     lines = ["| Strategy | Benchmark | Seed | Evaluations | Best feasible | Regret | Terminated |"]
@@ -554,6 +647,21 @@ def build(
         comparison_table(cells, strategies, simulators),
         "",
     ]
+
+    compliance = compliance_table(summaries)
+    if compliance:
+        sections += [
+            "## Structured output — did the model return usable JSON?",
+            "",
+            "Counted over calls that reached a provider; replays from the cache are",
+            "excluded, or a re-run would report 100%. Constrained decoding guarantees",
+            "the reply *parses*, so what is measured here is stricter: replies the",
+            "Pydantic schema accepted **on the first attempt**, with calls that never",
+            "produced valid output at all counted in the denominator.",
+            "",
+            compliance,
+            "",
+        ]
 
     if floors:
         sections += [

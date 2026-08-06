@@ -9,6 +9,7 @@ another.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -72,7 +73,7 @@ class CerebrasProvider:
         user: str,
         max_tokens: int,
         temperature: float,
-        json_mode: bool,
+        schema: Mapping[str, Any] | None,
     ) -> Completion:
         if not self._api_key:
             # Raised as permanent so the retry loop does not spend a minute
@@ -88,7 +89,12 @@ class CerebrasProvider:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        if json_mode:
+        if schema is not None:
+            # `json_object`, not `json_schema`. The OpenAI-compatible strict
+            # schema mode is not uniformly supported across Cerebras models, and
+            # this is the fallback provider — an unconstrained reply that the
+            # router then validates is a better failure mode than a 400 from the
+            # thing that is supposed to rescue the run.
             payload["response_format"] = {"type": "json_object"}
 
         try:

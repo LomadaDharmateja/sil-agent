@@ -52,16 +52,20 @@ class FakeProvider:
         self._replies = list(replies)
         self.prompts: list[str] = []
         self.models: list[str] = []
+        self.schemas: list[object] = []
+        self.max_tokens: list[int] = []
         self.calls = 0
 
     @property
     def name(self) -> str:
         return self._name
 
-    def generate(self, *, model, system, user, max_tokens, temperature, json_mode) -> Completion:
+    def generate(self, *, model, system, user, max_tokens, temperature, schema) -> Completion:
         self.calls += 1
         self.prompts.append(user)
         self.models.append(model)
+        self.schemas.append(schema)
+        self.max_tokens.append(max_tokens)
         reply = self._replies.pop(0) if self._replies else '{"x1": 0, "x2": 0}'
         if isinstance(reply, Exception):
             raise reply

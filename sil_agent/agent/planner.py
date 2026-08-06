@@ -43,7 +43,7 @@ from sil_agent.agent.state import (
     ParameterSpace,
     ParamKind,
 )
-from sil_agent.prompts import load
+from sil_agent.prompts import PromptTemplate, load
 from sil_agent.services.router import ModelRouter, Prompt, Role
 
 # How much history the planner is shown. Small on purpose — see the module
@@ -215,6 +215,35 @@ def describe_best(best: Best | None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def render_planner_prompt(
+    template: PromptTemplate,
+    goal: Goal,
+    history: Sequence[Episode],
+    best: Best | None,
+    *,
+    max_evaluations: int,
+) -> tuple[str, str]:
+    """Render the exact (system, user) pair the planner sends.
+
+    Extracted from ``Planner.propose`` so that the benchmark-anonymity test can
+    inspect *what the model actually receives*. A test that rebuilt the prompt
+    itself would keep passing after this function changed, which is precisely
+    the leak it exists to catch.
+    """
+    evaluated = sum(1 for e in history if e.sim_result is not None)
+
+    system, user = template.render(
+        objective=describe_objective(goal),
+        parameter_space=describe_space(goal.parameter_space),
+        constraints=describe_constraints(goal),
+        evaluations_used=evaluated,
+        max_evaluations=max_evaluations,
+        best_block=describe_best(best),
+        history_block=describe_history(history, goal),
+    )
+    return system, user
+
+
 class Planner:
     """Asks the model for one candidate, given persisted state only."""
 
@@ -237,16 +266,8 @@ class Planner:
         Validating here would give the LLM path its own private guard and make
         the ablation compare two different pipelines.
         """
-        evaluated = sum(1 for e in history if e.sim_result is not None)
-
-        system, user = self._template.render(
-            objective=describe_objective(goal),
-            parameter_space=describe_space(goal.parameter_space),
-            constraints=describe_constraints(goal),
-            evaluations_used=evaluated,
-            max_evaluations=max_evaluations,
-            best_block=describe_best(best),
-            history_block=describe_history(history, goal),
+        system, user = render_planner_prompt(
+            self._template, goal, history, best, max_evaluations=max_evaluations
         )
 
         proposal, cost = self._router.complete(

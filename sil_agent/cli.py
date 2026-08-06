@@ -45,16 +45,20 @@ def build_strategy(
     max_evaluations: int,
     run_id: UUID,
     repo: RunRepository,
+    seed: int,
 ) -> Strategy:
     """Construct a strategy, turning an unknown name into a clean CLI exit.
 
     The budget is passed through because grid search sizes its grid from it.
     On resume it comes from the stored ``BudgetState``, never from the command
     line — see ``strategies/registry.py``.
+
+    ``seed`` reaches the model's sampler as well as the strategy's RNG, so two
+    runs differing only in seed are genuinely different runs.
     """
 
     def router_factory() -> ModelRouter:
-        return CachingRouter(build_default_router(), repo, run_id)
+        return CachingRouter(build_default_router(seed=seed), repo, run_id)
 
     try:
         return _build_strategy(
@@ -122,7 +126,11 @@ def command_run(args: argparse.Namespace) -> int:
 
     run_id = uuid4()
     strategy = build_strategy(
-        args.strategy, max_evaluations=args.episodes, run_id=run_id, repo=repo
+        args.strategy,
+        max_evaluations=args.episodes,
+        run_id=run_id,
+        repo=repo,
+        seed=args.seed,
     )
 
     now = utcnow()
@@ -184,6 +192,9 @@ def command_resume(args: argparse.Namespace) -> int:
         max_evaluations=state.budget.max_evaluations,
         run_id=state.run_id,
         repo=repo,
+        # From the persisted state, never from the command line — same reason as
+        # the budget above. A resumed run must sample exactly as it did before.
+        seed=state.seed,
     )
 
     print(f"run_id: {state.run_id}", flush=True)

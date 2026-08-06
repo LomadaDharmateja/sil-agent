@@ -429,6 +429,28 @@ class CostRecord(Frozen):
     cost_eur: float = Field(default=0.0, ge=0.0)
     model: str | None = None
 
+    # How many times the router had to show the model its own bad output and ask
+    # again before the reply satisfied the caller's schema. Zero is compliance.
+    #
+    # Recorded from Phase 3.5, when the primary model became a local 4B one.
+    # Small models are materially worse at structured output, and
+    # `TECHNICAL_DESIGN.md` §5 requires that weakness to be *measured and
+    # reported* rather than hidden behind the repair loop: a weakness with a
+    # number attached is a result, one without is a liability.
+    #
+    # Defaulted, so episodes written before this field existed still load.
+    repair_attempts: int = Field(default=0, ge=0)
+
+    @property
+    def schema_compliant_first_try(self) -> bool:
+        """Whether the model got it right without being corrected.
+
+        Only meaningful when ``calls > 0``. A replay from the cache reports
+        ``calls == 0``, and counting those would drive any compliance rate to
+        100% on the second run of an experiment.
+        """
+        return self.repair_attempts == 0
+
     @classmethod
     def zero(cls) -> CostRecord:
         return cls()

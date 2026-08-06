@@ -26,10 +26,10 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -43,6 +43,21 @@ from sil_agent.services.retry import (
     RetryRecord,
     call_with_backoff,
 )
+
+# Why the ablation does not run at temperature 0.
+#
+# Phase 3.5's first LLM matrix produced *identical* results across all five
+# seeds, because greedy decoding ignores the seed entirely. Five identical runs
+# reported as five seeds is pseudoreplication — the exact error Phase 2 caught
+# in grid search, where five identical values yielded the most significant
+# p-value attainable at n=5.
+#
+# `TECHNICAL_DESIGN.md` §5 calls five seeds non-negotiable, and the reason is
+# variance: a mean with no spread around it cannot be compared to anything. So
+# the model samples, and the run's seed drives the sampler. Each seed is then a
+# genuinely independent replicate *and* individually reproducible — which is
+# strictly more than temperature 0 gave, not a concession.
+SAMPLING_TEMPERATURE = 0.7
 
 
 class Role(StrEnum):
@@ -150,10 +165,12 @@ class ModelSpec:
     provider: str
     model: str
     max_tokens: int = 2048
-    # Zero by default. It does not make a model deterministic — providers batch
-    # requests and route across hardware that reorders floating-point work — but
-    # it does remove the sampling noise that is under our control, which is the
-    # most that can honestly be claimed. See docs/phases/phase-03-brief.md.
+    # Zero by default. On a hosted provider it does not make a model
+    # deterministic — requests are batched and routed across hardware that
+    # reorders floating-point work — but it does remove the sampling noise that
+    # is under our control. See docs/phases/phase-03-brief.md.
+    #
+    # Phase 3.5 overrides it for the ablation; see SAMPLING_TEMPERATURE.
     temperature: float = 0.0
 
 
@@ -229,9 +246,21 @@ class DefaultRouter:
         completion_tokens = 0
         model_used = spec.model
 
+        # The JSON Schema the caller wants back. Providers that can constrain
+        # decoding against it do; the rest are merely asked for JSON. Either
+        # way `parse_into` below remains the sole authority on acceptance.
+        wanted = schema.model_json_schema()
+
         for attempt in range(self._config.max_repair_attempts + 1):
             completion, used_spec = self._generate(
-                spec, Prompt(system=prompt.system, user=user_prompt), role
+                spec,
+                Prompt(
+                    system=prompt.system,
+                    user=user_prompt,
+                    max_tokens=prompt.max_tokens,
+                ),
+                role,
+                wanted,
             )
             calls += 1
             prompt_tokens += completion.prompt_tokens
@@ -254,8 +283,13 @@ class DefaultRouter:
                 calls=calls,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                cost_eur=0.0,  # free tiers during development
+                cost_eur=0.0,  # local inference, and free tiers before it
                 model=f"{used_spec.provider}:{model_used}@{prompt.template_version}",
+                # `attempt` is 0 when the first reply validated. This is the
+                # schema-compliance measurement TECHNICAL_DESIGN §5 asks for,
+                # and it is taken here rather than inferred later because this
+                # is the only place that knows how many tries it took.
+                repair_attempts=attempt,
             )
             return parsed, cost
 
@@ -273,7 +307,11 @@ class DefaultRouter:
         return spec
 
     def _generate(
-        self, spec: ModelSpec, prompt: Prompt, role: Role
+        self,
+        spec: ModelSpec,
+        prompt: Prompt,
+        role: Role,
+        schema: Mapping[str, Any] | None,
     ) -> tuple[Completion, ModelSpec]:
         """Call the preferred provider, falling back through the rest.
 
@@ -299,7 +337,7 @@ class DefaultRouter:
                 continue
 
             try:
-                completion, retries = self._call_once(provider, active, prompt)
+                completion, retries = self._call_once(provider, active, prompt, schema)
             except (RetriesExhausted, PermanentError) as exc:
                 failures.append((provider_name, exc))
                 continue
@@ -343,7 +381,11 @@ class DefaultRouter:
             time.sleep(interval - elapsed)
 
     def _call_once(
-        self, provider: Provider, spec: ModelSpec, prompt: Prompt
+        self,
+        provider: Provider,
+        spec: ModelSpec,
+        prompt: Prompt,
+        schema: Mapping[str, Any] | None,
     ) -> tuple[Completion, RetryRecord]:
         """One provider, with the full retry budget.
 
@@ -363,7 +405,7 @@ class DefaultRouter:
                 user=prompt.user,
                 max_tokens=prompt.max_tokens or spec.max_tokens,
                 temperature=spec.temperature,
-                json_mode=True,
+                schema=schema,
             )
 
         return call_with_backoff(operation, policy=self._config.backoff)
@@ -495,19 +537,41 @@ def _repair_prompt(original: str, bad_output: str, complaint: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_default_router(*, on_call: Callable[[CallRecord], None] | None = None) -> DefaultRouter:
+def build_default_router(
+    *,
+    on_call: Callable[[CallRecord], None] | None = None,
+    seed: int | None = None,
+) -> DefaultRouter:
     """Construct the router described by the environment.
 
     Keys come from ``.env`` and never from code. A provider whose key is absent
     is simply not registered, so a machine with only one key configured works
     without any switch being flipped.
+
+    ``seed`` is the *run's* seed, and passing it is what makes a five-seed LLM
+    comparison mean anything. See ``SAMPLING_TEMPERATURE`` below.
     """
     from sil_agent.services.providers.cerebras import DEFAULT_MODEL as CEREBRAS_MODEL
     from sil_agent.services.providers.cerebras import CerebrasProvider
     from sil_agent.services.providers.gemini import DEFAULT_MODEL as GEMINI_MODEL
     from sil_agent.services.providers.gemini import GeminiProvider
+    from sil_agent.services.providers.ollama import DEFAULT_MODEL as OLLAMA_MODEL
+    from sil_agent.services.providers.ollama import DEFAULT_NUM_CTX, OllamaProvider
 
     providers: dict[str, Provider] = {}
+
+    # Ollama needs no key — the credential is a process on localhost — so it is
+    # registered unless explicitly disabled. Registering it does not start it:
+    # if nothing is listening, the call fails as a transport error and falls
+    # back, which is the same path any other unavailable provider takes.
+    if os.environ.get("SIL_DISABLE_OLLAMA", "").lower() not in ("1", "true", "yes"):
+        providers["ollama"] = OllamaProvider(
+            num_ctx=int(os.environ.get("OLLAMA_NUM_CTX", DEFAULT_NUM_CTX)),
+            # The run's seed, so seed 1 and seed 2 are genuinely different runs
+            # rather than the same run recorded twice.
+            seed=int(os.environ["OLLAMA_SEED"]) if "OLLAMA_SEED" in os.environ
+            else (seed if seed is not None else 0),
+        )
     if os.environ.get("CEREBRAS_API_KEY"):
         providers["cerebras"] = CerebrasProvider()
     if os.environ.get("GEMINI_API_KEY"):
@@ -515,11 +579,14 @@ def build_default_router(*, on_call: Callable[[CallRecord], None] | None = None)
 
     if not providers:
         raise PermanentError(
-            "No LLM provider configured. Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env "
-            "(see .env.example)."
+            "No LLM provider configured. Run Ollama locally (see .env.example), or set "
+            "CEREBRAS_API_KEY or GEMINI_API_KEY in .env."
         )
 
-    preferred = os.environ.get("SIL_PRIMARY_PROVIDER", "cerebras")
+    # Local by default from Phase 3.5. Not only because hosted free tiers cannot
+    # carry the experiment, but because a pinned local model reruns
+    # byte-identically in two years and no hosted API can promise that.
+    preferred = os.environ.get("SIL_PRIMARY_PROVIDER", "ollama")
     if preferred not in providers:
         preferred = next(iter(providers))
 
@@ -531,19 +598,27 @@ def build_default_router(*, on_call: Callable[[CallRecord], None] | None = None)
     # a quota decision, not a quality one, and it has to be changeable without
     # editing code.
     provider_models = {
+        "ollama": os.environ.get("SIL_OLLAMA_MODEL") or OLLAMA_MODEL,
         "cerebras": os.environ.get("SIL_CEREBRAS_MODEL") or CEREBRAS_MODEL,
         "gemini": os.environ.get("SIL_GEMINI_MODEL") or GEMINI_MODEL,
     }
+    temperature = float(os.environ.get("SIL_TEMPERATURE", SAMPLING_TEMPERATURE))
     specs = {
-        name: ModelSpec(provider=name, model=model) for name, model in provider_models.items()
+        name: ModelSpec(provider=name, model=model, temperature=temperature)
+        for name, model in provider_models.items()
     }
     primary = specs[preferred]
 
     # Requests per minute on each free tier, converted to a minimum spacing.
     # Gemini Flash-Lite allows 15/min; Cerebras is more generous but the same
     # pacing costs nothing when the quota is not the constraint.
+    #
+    # Local inference has no rate limit at all, and pacing it would add four
+    # seconds of deliberate idling to every episode of a run that already takes
+    # hours. Zero is correct, not an oversight.
     rpm = {"gemini": 15.0, "cerebras": 30.0}.get(preferred, 15.0)
-    min_interval_s = float(os.environ.get("SIL_MIN_CALL_INTERVAL_S", 60.0 / rpm))
+    default_interval = 0.0 if preferred == "ollama" else 60.0 / rpm
+    min_interval_s = float(os.environ.get("SIL_MIN_CALL_INTERVAL_S", default_interval))
 
     return DefaultRouter(
         providers=providers,

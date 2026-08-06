@@ -32,7 +32,13 @@ from dataclasses import dataclass
 from statistics import median
 from uuid import UUID
 
-from sil_agent.agent.state import Direction, Episode, RunStatus, TerminationReason
+from sil_agent.agent.state import (
+    Direction,
+    Episode,
+    RunStatus,
+    TerminationReason,
+    ToolError,
+)
 from sil_agent.persistence.repo import StoredRun
 from sil_agent.simulators.toy import Benchmark
 
@@ -65,9 +71,34 @@ class RunSummary:
     # curves from different runs can be compared point by point.
     regret_curve: tuple[float | None, ...]
 
+    # Structured-output quality, from Phase 3.5. `model_calls` counts only calls
+    # that actually reached a provider; `compliant_calls` is how many of those
+    # were accepted by the caller's schema on the first attempt.
+    model_calls: int = 0
+    compliant_calls: int = 0
+    schema_failures: int = 0
+
     @property
     def is_complete(self) -> bool:
         return self.termination is not None
+
+    @property
+    def schema_compliance(self) -> float | None:
+        """Fraction of model calls that produced valid output first time.
+
+        ``None`` when there were no model calls at all, which is every baseline
+        — a strategy that never asks a model has no compliance rate, and
+        reporting 100% for it would be nonsense.
+
+        The denominator includes calls that never produced anything usable
+        (``schema_failures``). Leaving those out would measure compliance only
+        among the calls that eventually complied, which is close to measuring
+        nothing.
+        """
+        total = self.model_calls + self.schema_failures
+        if total == 0:
+            return None
+        return self.compliant_calls / total
 
 
 def derive_termination(stored: StoredRun) -> TerminationReason | None:
@@ -175,12 +206,32 @@ def summarise_run(stored: StoredRun, benchmark: Benchmark) -> RunSummary:
     else:
         regret_curve = [None] * budget.max_evaluations
 
+    # Schema compliance, counted over calls that genuinely reached a provider.
+    #
+    # `cost.calls == 0` means the answer came from the replay cache, and
+    # including replays would drive the rate to 100% the second time an
+    # experiment is run — measuring the cache rather than the model.
+    model_calls = sum(1 for e in episodes if e.cost.calls > 0)
+    compliant_calls = sum(
+        1 for e in episodes if e.cost.calls > 0 and e.cost.schema_compliant_first_try
+    )
+    # Calls that never produced schema-valid output at all. These raise before a
+    # CostRecord exists, so they appear only as the episode's error.
+    schema_failures = sum(
+        1
+        for e in episodes
+        if isinstance(e.result, ToolError) and e.result.kind == "LLMOutputError"
+    )
+
     return RunSummary(
         run_id=stored.state.run_id,
         strategy=stored.strategy,
         simulator=stored.simulator,
         seed=stored.state.seed,
         termination=derive_termination(stored),
+        model_calls=model_calls,
+        compliant_calls=compliant_calls,
+        schema_failures=schema_failures,
         evaluations=evaluations,
         rejections=rejections,
         max_evaluations=budget.max_evaluations,

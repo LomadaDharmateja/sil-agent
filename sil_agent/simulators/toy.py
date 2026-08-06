@@ -15,6 +15,20 @@ implementations at sfu.ca rather than from memory. One trap is worth spelling
 out: that reference's ``hart6.m`` returns the *rescaled* Hartmann-6,
 ``-(2.58 + outer) / 1.94``, whose minimum is not -3.32237. The unrescaled form
 implemented here is the one with the documented -3.32237 optimum.
+
+**Nothing here tells the model which function it is looking at.** Phase 3 found
+that the planner had memorised these benchmarks — ``SingleShotLLM`` proposed all
+three of Branin's global minima to four decimal places before seeing a single
+result. Identity reached the model through three channels, and two of them are
+closed here: ``goal_text`` no longer names the function, and the objective metric
+is ``objective`` rather than ``branin``.
+
+The third channel cannot be closed by renaming. A 2-D problem over exactly
+``[-5, 10] x [0, 15]`` *is* Branin to anything that has read the literature,
+whatever its parameters are called, and the domain cannot be changed without
+changing the function. So the originals remain recognisable, and only the
+shifted instances registered at the bottom of this module are genuinely
+anonymous. See ``simulators/instances.py``.
 """
 
 from __future__ import annotations
@@ -131,6 +145,23 @@ ROSENBROCK_DIM = 4
 # ---------------------------------------------------------------------------
 
 
+# The metric every benchmark reports its objective under. Deliberately the same
+# string for all of them: a metric called `branin` names the function in every
+# prompt that renders the objective, which is a leak the planner acted on.
+ANONYMOUS_METRIC = "objective"
+
+# What the planner is told about the problem. Everything specific — dimension,
+# bounds, parameter names — is rendered separately from the parameter space, so
+# this text carries no identifying information at all. The explicit refusal to
+# promise smoothness or unimodality is there because a planner told nothing
+# tends to assume a well-behaved bowl.
+ANONYMOUS_GOAL_TEXT = (
+    "Minimise `objective` over the parameters below. The function is unknown: "
+    "no analytic form, no published optimum, and no assumption of smoothness, "
+    "separability or unimodality is available to you."
+)
+
+
 def _space(names: Sequence[str], bounds: Sequence[tuple[float, float]]) -> ParameterSpace:
     return ParameterSpace(
         params=[
@@ -161,11 +192,22 @@ class Benchmark:
     constraints: tuple[Constraint, ...] = ()
     extra_metrics: Callable[[list[float]], dict[str, float]] = field(default=lambda _: {})
 
+    # Set on shifted/rotated instances; None on the originals. Recorded as a
+    # field rather than left implicit in the name so that the transform behind a
+    # published number is queryable rather than inferred from a string, and
+    # printed in the report header.
+    instance_seed: int | None = None
+    base_name: str | None = None
+
+    @property
+    def is_instance(self) -> bool:
+        return self.instance_seed is not None
+
 
 BRANIN = Benchmark(
     name="branin",
     space=_space(["x1", "x2"], [(-5.0, 10.0), (0.0, 15.0)]),
-    objective_metric="branin",
+    objective_metric=ANONYMOUS_METRIC,
     direction=Direction.MINIMISE,
     objective=lambda x: branin(x[0], x[1]),
     known_optimum=0.397887,
@@ -174,7 +216,7 @@ BRANIN = Benchmark(
         (math.pi, 2.275),
         (3.0 * math.pi, 2.475),
     ),
-    goal_text="Minimise the Branin function over x1 in [-5, 10] and x2 in [0, 15].",
+    goal_text=ANONYMOUS_GOAL_TEXT,
 )
 
 # The constrained variant exists so that constraint handling — violations,
@@ -183,7 +225,7 @@ BRANIN = Benchmark(
 BRANIN_CONSTRAINED = Benchmark(
     name="branin_constrained",
     space=BRANIN.space,
-    objective_metric="branin",
+    objective_metric=ANONYMOUS_METRIC,
     direction=Direction.MINIMISE,
     objective=lambda x: branin(x[0], x[1]),
     known_optimum=0.397887,
@@ -193,10 +235,7 @@ BRANIN_CONSTRAINED = Benchmark(
     #   (3pi,  2.475) sums to 11.90  -> excluded by the constraint
     # So the constrained optimum value is unchanged at 0.397887.
     known_optimisers=((-math.pi, 12.275), (math.pi, 2.275)),
-    goal_text=(
-        "Minimise the Branin function subject to x1 + x2 <= 10, "
-        "with x1 in [-5, 10] and x2 in [0, 15]."
-    ),
+    goal_text=ANONYMOUS_GOAL_TEXT,
     constraints=(Constraint(metric="x1_plus_x2", operator=ConstraintOp.LE, threshold=10.0),),
     extra_metrics=lambda x: {"x1_plus_x2": x[0] + x[1]},
 )
@@ -204,12 +243,12 @@ BRANIN_CONSTRAINED = Benchmark(
 HARTMANN6 = Benchmark(
     name="hartmann6",
     space=_space([f"x{i}" for i in range(1, 7)], [(0.0, 1.0)] * 6),
-    objective_metric="hartmann6",
+    objective_metric=ANONYMOUS_METRIC,
     direction=Direction.MINIMISE,
     objective=hartmann6,
     known_optimum=-3.32237,
     known_optimisers=((0.20169, 0.150011, 0.476874, 0.275332, 0.311652, 0.6573),),
-    goal_text="Minimise the 6-dimensional Hartmann function over the unit hypercube.",
+    goal_text=ANONYMOUS_GOAL_TEXT,
 )
 
 ROSENBROCK = Benchmark(
@@ -218,16 +257,27 @@ ROSENBROCK = Benchmark(
         [f"x{i}" for i in range(1, ROSENBROCK_DIM + 1)],
         [(-5.0, 10.0)] * ROSENBROCK_DIM,
     ),
-    objective_metric="rosenbrock",
+    objective_metric=ANONYMOUS_METRIC,
     direction=Direction.MINIMISE,
     objective=rosenbrock,
     known_optimum=0.0,
     known_optimisers=((1.0,) * ROSENBROCK_DIM,),
-    goal_text=f"Minimise the {ROSENBROCK_DIM}-dimensional Rosenbrock function over [-5, 10].",
+    goal_text=ANONYMOUS_GOAL_TEXT,
 )
 
 BENCHMARKS: dict[str, Benchmark] = {
     benchmark.name: benchmark for benchmark in (BRANIN, BRANIN_CONSTRAINED, HARTMANN6, ROSENBROCK)
+}
+
+# Which shifted instances exist. One instance per benchmark for now: instance
+# variation is a second, legitimate noise axis alongside the run seed, but
+# Phase 2 measured the *seed* noise floor and mixing the two would confound
+# them. Adding a seed here creates a new simulator and cannot disturb an
+# existing one.
+INSTANCE_SEEDS: dict[str, tuple[int, ...]] = {
+    "branin": (1,),
+    "hartmann6": (1,),
+    "rosenbrock": (1,),
 }
 
 
@@ -322,3 +372,32 @@ class ToySimulator:
             artifacts={},
             wall_time_s=time.perf_counter() - started,
         )
+
+
+# ---------------------------------------------------------------------------
+# Shifted instances
+# ---------------------------------------------------------------------------
+#
+# Registered here, at the bottom, rather than in `instances.py`. Two reasons:
+#
+# * `BENCHMARKS` stays the single registry, so `ToySimulator.from_name`, the
+#   CLI's `--simulators` choices and the report's benchmark lookup all keep
+#   working with no knowledge that instances exist.
+# * `instances.py` imports `Benchmark` from this module, so importing it at the
+#   top would be circular. By the time this line runs every name it needs is
+#   defined, which is what makes the deferred import safe rather than merely
+#   convenient.
+#
+# An instance is registered under `<base>_i<seed>` — the instance is part of the
+# *simulator's identity*, not a separate axis. That is deliberate: the report
+# groups by simulator name, and two instances of Branin are different functions.
+# If the instance seed lived anywhere else, two of them would pool into one row
+# and be averaged as though they were repeated seeds of one problem, which is
+# exactly the pseudoreplication error Phase 2 caught in grid search.
+
+from sil_agent.simulators.instances import make_instance  # noqa: E402
+
+for _base_name, _seeds in INSTANCE_SEEDS.items():
+    for _seed in _seeds:
+        _instance = make_instance(BENCHMARKS[_base_name], _seed)
+        BENCHMARKS[_instance.name] = _instance

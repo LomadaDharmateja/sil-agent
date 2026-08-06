@@ -154,7 +154,10 @@ def test_default_goal_uses_the_simulators_own_parameter_space() -> None:
     goal = simulator.default_goal()
     assert goal.parameter_space == simulator.describe()
     assert goal.objective.direction is Direction.MINIMISE
-    assert goal.objective.metric == "branin"
+    # `objective`, not `branin`: the metric name is rendered into every planner
+    # prompt, so naming the function here told the model which function it was.
+    # See tests/test_instances.py for the anonymity checks this supports.
+    assert goal.objective.metric == "objective"
 
 
 # ---------------------------------------------------------------------------

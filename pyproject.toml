@@ -94,7 +94,15 @@ disallow_untyped_defs = false
 testpaths = ["tests"]
 markers = [
     "db: test requires a reachable Postgres (TEST_DATABASE_URL)",
+    "live: test calls a real model; excluded by default (run with `-m live`)",
 ]
+# `CLAUDE.md`: LLM calls are mocked in tests. The memorisation comparison is the
+# one thing that genuinely cannot be — a mocked model proves nothing about what
+# a real one has memorised — so it is written as a test and then deselected, so
+# the default suite stays offline, fast and deterministic. Run it deliberately:
+#
+#     uv run pytest -m live -s
+addopts = ["-m", "not live"]
 # pytest installs its own warning filters around every test, which overrides the
 # one `strategies/optuna_tpe.py` sets at import. The filter has to be repeated
 # here to keep it in force under pytest. Kept as narrow as the original: this

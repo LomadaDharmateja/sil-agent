@@ -9,6 +9,7 @@ abstracts something. A second OpenAI-compatible vendor would have proved nothing
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -53,7 +54,7 @@ class GeminiProvider:
         user: str,
         max_tokens: int,
         temperature: float,
-        json_mode: bool,
+        schema: Mapping[str, Any] | None,
     ) -> Completion:
         if not self._api_key:
             raise PermanentError("gemini: GEMINI_API_KEY is not set")
@@ -62,7 +63,17 @@ class GeminiProvider:
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
         }
-        if json_mode:
+        if schema is not None:
+            # Only the MIME type, deliberately — not `responseSchema`.
+            #
+            # Gemini's schema dialect is a narrow subset of OpenAPI, not JSON
+            # Schema, and it rejects constructs Pydantic emits routinely
+            # (`additionalProperties` on an open dict, some `anyOf` shapes).
+            # Translating between the two is a project of its own, and getting
+            # it wrong turns the *fallback* provider into a source of 400s —
+            # the failover path failing is worse than the failover path being
+            # unconstrained. Ollama, the primary from Phase 3.5, uses the
+            # schema for real.
             generation_config["responseMimeType"] = "application/json"
 
         payload: dict[str, Any] = {

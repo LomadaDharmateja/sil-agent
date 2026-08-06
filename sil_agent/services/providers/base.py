@@ -8,7 +8,8 @@ a small, obviously-correct file.
 
 from __future__ import annotations
 
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Any, Protocol
 
 import httpx
 
@@ -45,13 +46,26 @@ class Provider(Protocol):
         user: str,
         max_tokens: int,
         temperature: float,
-        json_mode: bool,
+        schema: Mapping[str, Any] | None,
     ) -> Completion:
         """Produce a completion, or raise TransientError / PermanentError.
 
-        ``json_mode`` is a *hint*. Providers implement it inconsistently and some
-        ignore it, so the router validates the result either way and treats a
-        non-JSON reply as an ordinary outcome rather than an impossibility.
+        ``schema`` is the JSON Schema the caller wants back, or None for free
+        text. What a provider does with it varies enormously, and the difference
+        is the reason this replaced a plain ``json_mode: bool`` in Phase 3.5:
+
+        * **Ollama** compiles it to a grammar and constrains decoding, so the
+          model *cannot* emit non-conforming JSON.
+        * **Cerebras and Gemini** are told only "reply in JSON" — their
+          structured-output dialects are narrower than JSON Schema and
+          translating Pydantic's output into them is its own project.
+
+        So this is a request, not a guarantee, and the router validates the
+        result either way.
+
+        **Constrained decoding is not Rule 2.** A grammar enforces syntax, never
+        meaning: ``{"params": {"invented_knob": 1}}`` conforms perfectly and is
+        still a hallucinated parameter. The guard stays exactly where it is.
         """
         ...
 

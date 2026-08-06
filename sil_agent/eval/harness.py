@@ -122,16 +122,20 @@ class ExperimentSpec:
         return len(self.strategies) * len(self.simulators) * len(self.seeds)
 
 
-def _router_factory(run_id: UUID, repo: RunRepository) -> Callable[[], ModelRouter]:
+def _router_factory(run_id: UUID, repo: RunRepository, seed: int) -> Callable[[], ModelRouter]:
     """A router that records every call against this run and replays repeats.
 
     Returned as a factory rather than a router so that nothing is constructed —
     and no API key is needed — unless a strategy actually asks for one. A matrix
     of baselines runs on a machine with no key configured.
+
+    ``seed`` is the cell's seed, and it reaches the *model's* sampler. Without
+    it every seed of an LLM strategy produces the same run, and a five-seed
+    comparison is five copies of one measurement.
     """
 
     def build() -> ModelRouter:
-        return CachingRouter(build_default_router(), repo, run_id)
+        return CachingRouter(build_default_router(seed=seed), repo, run_id)
 
     return build
 
@@ -205,7 +209,7 @@ def execute_cell(cell: Cell, spec: ExperimentSpec, repo: RunRepository) -> CellO
         # Every model call is recorded against this run and replayed on a second
         # invocation, so re-running a finished matrix costs nothing and a
         # resumed run reuses the answers it already paid for.
-        router_factory=_router_factory(cell.run_id, repo),
+        router_factory=_router_factory(cell.run_id, repo, cell.seed),
     )
 
     result = run_loop(state=state, simulator=simulator, strategy=strategy, repo=repo)

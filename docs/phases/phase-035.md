@@ -254,6 +254,40 @@ reported the right answer for the wrong reasons. Redone by replaying the real
 recorded prompts out of `llm_calls`; the conclusion held, but it would not have
 been worth stating from the first version.
 
+**Two processes wrote to the same run, and the Phase 1 guard was the only thing
+that noticed.** The budget sweep's shell script was killed partway through, so I
+reissued it — and the *child* `ablate` process had survived the kill. Two
+processes were then walking the same experiment. What stopped it being a silent
+corruption was a line written in Phase 1:
+
+```
+episode 11 of run ef366677-... already exists - another process is writing to
+this run. Stopping. (Run locking arrives in Phase 3.)
+```
+
+The natural key on `(run_id, idx)` refused the duplicate write. No run was
+corrupted, and the two interrupted runs were left `EXECUTING` — which
+`derive_termination` maps to `None`, so the harness resumes them rather than
+mistaking them for finished. Both properties were designed in Phase 1 against a
+hypothetical; this is the first time either was needed in anger.
+
+The irony is that Phase 3 built `services/locks.py` for exactly this and the
+harness does not use it — locking is wired for the CLI's single-run path, not for
+`execute_cell`. Recorded as the obvious next use of code that already exists.
+
+The operational lesson is smaller and duller: **killing a task does not always
+kill its children.** Check for a surviving process before reissuing a long run.
+
+It happened repeatedly, because the budget-80 sweep runs are longer than the
+harness that launches them will tolerate — every invocation was cut short after a
+few minutes. The sweep still finished, one re-issue at a time, and that is worth
+recording as the clearest vindication of Phase 1 in the project so far: **the
+80-evaluation cells were assembled across five separate killed processes**, with
+no resume flag, no job table and no manual bookkeeping. `ensure_run` loads what
+exists, `rehydrate` recomputes position from the episodes table, and the natural
+key makes a re-issued command a no-op over the parts already done. The only thing
+I had to get right was not starting a second writer.
+
 **The live tests ran by default and broke the offline rule.** `CLAUDE.md`
 requires LLM calls to be mocked, and the memorisation comparison is the one thing
 that genuinely cannot be — a mocked model proves nothing about what a real one
@@ -277,12 +311,16 @@ Phase 4 can now be both **run** and **believed**, which it could not be before.
   have an error bar and be tested against the noise floor.
 - `schema_compliance` is in the report, so Phase 10's distillation target has a
   baseline to beat.
+- **`sil-agent sweep` exists**, so Phase 4's question can be asked at the right
+  width from the start: not "does reflection pay?" but "at which budgets does
+  reflection pay?". `agent_full` becomes one more curve on the same axes, and
+  the crossover it needs to move is already measured at ~37 evaluations.
 
 ## Numbers
 
 | Measurement | Value |
 |---|---|
-| Tests | 287 (283 offline, 2 skipped in high dimension, 2 live and deselected) |
+| Tests | 305 (301 offline, 2 skipped in high dimension, 2 live and deselected) |
 | Tests requiring a network or API key | **0** |
 | Suite runtime | ~22 s offline; ~94 s for the two live tests |
 | Model | `qwen3:4b-q4_K_M`, pinned including quantisation |
@@ -346,8 +384,14 @@ why every baseline was re-run.
 
 ### The comparison, on shifted instances, with a local 4B model
 
-`phase35-main`: 5 strategies × 2 instances × 5 seeds × 20 evaluations. Final
+`phase35-main`: 5 strategies × 2 instances × 5 seeds × **20 evaluations**. Final
 regret, mean ± standard deviation, lower is better.
+
+**The budget in that sentence is not a detail, it is the claim.** Everything
+below is about behaviour under a tight budget; none of it says the agent is a
+better optimiser than TPE in general, and TPE at 200 evaluations reaches regret
+0.0188 — an order of magnitude below anything measured here. See "Rescoping the
+claim" below.
 
 | Strategy | branin_i1 | hartmann6_i1 |
 |---|---|---|
@@ -421,11 +465,20 @@ benchmarks come out differently.
 **On branin_i1 the agent's advantage is real, but not because of the means.**
 The mean gap to TPE is 2.46, comfortably *inside* TPE's own 4.965 spread — so
 the mean comparison on its own proves nothing. What does hold up is the rank
-test on paired seeds (U=1, p=0.0159): the agent's five runs land at 0.069, 0.278,
-0.386, 0.507, 0.665 and TPE's at 0.632, 1.896, 2.170, 2.341, 7.151. Only one of
-twenty-five pairs inverts. The agent is not so much *better on average* as
-dramatically more **consistent** — TPE at 20 evaluations on this instance is
-erratic, which is what the enormous noise floor is describing.
+test on paired seeds: the agent's five runs land at 0.069, 0.278, 0.386, 0.507,
+0.665 and TPE's at 0.632, 1.896, 2.170, 2.341, 7.151. Only one of twenty-five
+pairs inverts, giving U=1 and an **exact two-sided p of 1/63 = 0.0159**. The
+agent is not so much *better on average* as dramatically more **consistent** —
+TPE at 20 evaluations on this instance is erratic, which is what the enormous
+noise floor is describing.
+
+A rank test rather than a t-test, deliberately: these regret distributions are
+heavily right-skewed (TPE's worst seed is 7.15 against a median of 2.17), which
+breaks the normality a t-test assumes and lets one unlucky seed drive the
+result. `method="exact"` is now named rather than left to scipy's `auto`; at
+n=5 `auto` already picks exact, but the normal approximation would report 0.0216
+for this same comparison and a later experiment with more seeds would have
+switched to it silently.
 
 **On hartmann6_i1 the advantage does not clear the floor.** Mean gap to TPE is
 0.49 against a spread of 0.762, and p=0.151. **No claim is made here.** The
@@ -435,6 +488,123 @@ The one comparison that is unambiguous on both benchmarks is
 `agent_no_reflection` against `single_shot_llm` — p=0.0119 and p=0.0236 — which
 is the "does looping help at all?" question the control exists to answer. On
 these instances, it does.
+
+### Was TPE benchmarked in its worst regime? Yes — and fixing it makes it worse
+
+Optuna's `TPESampler` was constructed with a seed and nothing else, so
+`n_startup_trials` was its default **10**. At a 20-evaluation budget that means
+**half of TPE's run is random sampling** before the model takes over. A baseline
+crippled by an unexamined default is not a baseline, and this one had gone
+unexamined through three phases.
+
+The obvious fix is to lower it. I measured before doing so — median final regret
+over 40 seeds, varying only that value:
+
+| budget | | start=3 | start=5 | start=8 | start=10 |
+|---|---|---|---|---|---|
+| 20 | branin_i1 | 2.723 | 2.664 | **1.686** | 1.689 |
+| 20 | hartmann6_i1 | 1.646 | **1.530** | 1.639 | 1.709 |
+| 40 | branin_i1 | 0.534 | 0.679 | 0.576 | **0.362** |
+| 80 | branin_i1 | **0.094** | 0.127 | 0.136 | 0.122 |
+
+**Lowering it does not help and mostly hurts.** The estimator needs those
+observations to build a density over; starved of them it models the space badly
+and the "wasted" random trials turn out to be the price of the model working at
+all. At budget 40 the default is clearly best.
+
+So the honest response to "TPE is in its worst regime" is: *yes, and that is
+inherent to the method at this budget, not an artefact of a badly chosen
+constant.* The value is now a named constant carrying that table as its
+justification, and the report prints it in the metadata with the warning
+attached, so no reader has to wonder.
+
+This is the second time this phase that a confident mechanical intuition — "half
+the budget is wasted", "constrained decoding is the real risk at 4B" — did not
+survive being measured. Both are recorded because the measurement is the
+contribution, not the guess.
+
+### Rescoping the claim: sample efficiency, not superiority
+
+Revised after Phase 3.5 shipped, because the original wording invited a reading
+the data does not support.
+
+"The agent reaches regret 0.381 where TPE reaches 2.838" is true and, stated
+without its budget, misleading. TPE on the *original* Branin at 200 evaluations
+reaches **0.0188** — an order of magnitude better than anything the agent has been
+measured at. Bayesian optimisation spends its early evaluations building a
+surrogate and only then exploits it; scoring it at 20 evaluations scores it
+before it has begun. Two specifics make that concrete:
+
+- Optuna's `n_startup_trials` is **10**. At a 20-evaluation budget, **half of
+  TPE's run is random sampling** by construction.
+- Phase 3 already found the same shape from the other direction: TPE's 5.7×
+  advantage over random search on Hartmann-6 at 200 evaluations *vanished* at 50.
+
+So the finding is **sample efficiency under a tight budget**: when evaluations
+are the scarce resource, a planner that can read results and reason about them in
+language gets useful faster than a surrogate that must first be fitted. That is a
+narrower claim and the one worth making, because it is the regime a real
+simulator lives in — the whole premise of the project is that each evaluation
+costs minutes.
+
+What was changed: the headline in `README.md`, the framing above this section,
+and the interview angle. What was *not* changed: any number. The measurements
+stand; only the sentence wrapped around them was too wide.
+
+### The budget sweep, and where the lead changes hands
+
+`sil_agent/eval/sweep.py` plus a `sweep` CLI command. Each point is an
+**independent run at that budget**, never a prefix of a longer one — the planner
+is told `max_evaluations` in its prompt, so a run that knows it has 80
+evaluations explores differently from one that knows it has 10, and truncating
+the long run would measure the wrong thing. (For TPE the distinction does not
+matter; for the agent it does, so the sweep pays for it on both.)
+
+Median final regret on **branin_i1**, with a rank test at each budget:
+
+| Budget | agent | TPE | leading median | p (exact) | |
+|---|---|---|---|---|---|
+| 10 | 3.02 | 10.98 | agent | 0.0556 | not significant |
+| 20 | **0.386** | 2.17 | agent | **0.0159** | **significant** |
+| 40 | 0.805 | 0.632 | TPE | 0.6905 | not significant |
+| 80 | 0.164 | 0.191 | agent | 1.0000 | not significant (n=3) |
+
+**The medians cross near 37 evaluations, and that crossing is not a finding.**
+This is the part I nearly got wrong. The curves cross, the interpolation is
+sound, and it would have made a satisfying headline — "TPE overtakes at 37" —
+except that *no budget above the crossing shows a significant difference*. At 40
+the two distributions are almost entirely overlapping (p=0.69); at 80 they are
+indistinguishable (p=1.00). The medians swap places twice.
+
+What the sweep actually shows is narrower and duller than a crossover: **the
+agent's advantage is real at 20 evaluations and has dissolved by 40.** It does
+not reverse — TPE never demonstrably overtakes within the budgets measured — it
+simply stops being detectable. The report now leads with the per-budget test and
+prints the crossing only as a median crossing, with that caveat attached.
+
+Having spent this session removing one overclaim, replacing it with a
+better-dressed one would have been the easy mistake. The per-budget rank test is
+in `sweep.py` for that reason: the medians alone invite exactly that reading.
+
+**hartmann6_i1**
+
+| Strategy | 10 evals | 20 evals | 40 evals |
+|---|---|---|---|
+| agent_no_reflection | **1.323** | **0.886** | **0.710** |
+| optuna_tpe | 2.54 | 1.223 | 1.052 |
+
+The agent leads at all three, and again this is weaker than it looks: the
+Phase 3.5 noise floor on this instance is 0.762, wider than any of these gaps.
+The agent's budget-80 cell was not run — see below.
+
+**Scope actually delivered.** The 80-evaluation cell on branin_i1 has three seeds
+rather than five, and hartmann6_i1 has no 80-evaluation agent cell at all. Each
+80-evaluation run is 80 sequential model calls and the harness running them kept
+being cut short; five re-issues got branin to three seeds. Rather than quietly
+plot a three-seed median next to five-seed ones, `sweep.py` detects unequal cells
+and the report prints a warning naming them. Stated here as an incomplete sweep,
+because the alternative — dropping the point and showing a clean three-budget
+curve — would have looked more finished and told the reader less.
 
 ### Structured output
 
@@ -533,11 +703,23 @@ decoding ignores the seed — five copies of one measurement reported as five
 replicates, which is the same pseudoreplication I had already found in grid
 search a phase earlier.
 
-The result underneath is worth stating too, because it is the first one in this
-project that survives its own scrutiny. On a function the model demonstrably
-cannot have read about, a local 4-billion-parameter model with a feedback loop
-reaches regret 0.38 where Optuna's TPE reaches 2.84 — and the same model with the
-loop removed reaches 4.24, worse than random search. The gap between those two
-is the loop, and in Phase 3 it had been invisible because memorisation saturated
-both. I also report where the claim stops: on the six-dimensional instance the
-lead sits inside the measured seed noise floor, so I do not make it.
+The result underneath is worth stating too, and stating at the right width. On a
+function the model demonstrably cannot have read about, a local 4-billion-parameter
+model with a feedback loop reaches regret 0.38 at twenty evaluations where
+Optuna's TPE reaches 2.84 — and the same model with the loop removed reaches
+4.24, worse than random search. The gap between those two is the loop, and in
+Phase 3 it had been invisible because memorisation saturated both.
+
+**That is a claim about sample efficiency under a tight budget, not about being a
+better optimiser**, and the budget sweep is what keeps it honest. Running both at
+10, 20, 40 and 80 evaluations, the agent's advantage is statistically supported
+at 20 (p=0.016) and gone by 40 (p=0.69) — the medians cross near 37, but no
+budget above the crossing shows a real difference, so the right description is
+*the edge dissolves*, not *TPE overtakes*. I nearly reported the crossover as the
+result; it was a better story and the per-budget rank test says it is not one.
+
+That is the honest version of the finding, and it is still the useful one: it
+says use this when evaluations cost minutes, and stop expecting anything from it
+once they do not. I also report where the claim stops entirely: on the
+six-dimensional instance the lead sits inside the measured seed noise floor, so I
+do not make it.

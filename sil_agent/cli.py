@@ -28,6 +28,7 @@ from sil_agent.agent.state import (
     utcnow,
 )
 from sil_agent.eval import report as report_module
+from sil_agent.eval import sweep as sweep_module
 from sil_agent.eval.harness import ExperimentSpec, execute
 from sil_agent.persistence.db import make_session_factory, resolve_database_url
 from sil_agent.persistence.repo import RunRepository
@@ -305,6 +306,20 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_sweep(args: argparse.Namespace) -> int:
+    repo = build_repository()
+    out_dir = Path(args.out) if args.out else Path("reports") / "sweep"
+
+    try:
+        markdown = sweep_module.build(args.experiments, repo, out_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"wrote {markdown}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -384,6 +399,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report_parser.add_argument("--out", default=None, help="output directory")
     report_parser.set_defaults(func=command_report)
+
+    sweep_parser = subparsers.add_parser(
+        "sweep",
+        help="regret against evaluation budget, across several experiments",
+        description=(
+            "Compares strategies at several evaluation budgets and locates the "
+            "budget at which the leader changes. Each experiment supplies one "
+            "budget, read from its runs rather than from a flag, so an experiment "
+            "cannot be filed under a budget it was not run at."
+        ),
+    )
+    sweep_parser.add_argument(
+        "--experiments",
+        nargs="+",
+        required=True,
+        help="experiment names, one per budget",
+    )
+    sweep_parser.add_argument("--out", default=None, help="output directory")
+    sweep_parser.set_defaults(func=command_sweep)
 
     return parser
 

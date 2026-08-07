@@ -40,6 +40,7 @@ from sil_agent.eval.metrics import (
 )
 from sil_agent.persistence.repo import RunRepository
 from sil_agent.simulators.toy import BENCHMARKS
+from sil_agent.strategies.optuna_tpe import N_STARTUP_TRIALS
 
 # ---------------------------------------------------------------------------
 # Chart styling
@@ -416,8 +417,14 @@ def comparison_table(
                 if len(left.values) < 3 or len(right.values) < 3:
                     continue
 
+                # `method="exact"` rather than scipy's default `"auto"`. At n=5
+                # per group `auto` already chooses exact, but naming it means the
+                # reported figure cannot silently become the normal
+                # approximation if a later experiment uses more seeds — the two
+                # disagree materially at these sizes (exact 0.0159 against
+                # asymptotic 0.0216 for the headline comparison).
                 statistic, p_value = mannwhitneyu(
-                    left.values, right.values, alternative="two-sided"
+                    left.values, right.values, alternative="two-sided", method="exact"
                 )
 
                 # A deterministic strategy contributes the same number once per
@@ -601,6 +608,22 @@ def build(
         f"- Benchmarks: {', '.join(simulators)}",
         f"- Seeds per cell: {len({s.seed for s in summaries})}",
         f"- Evaluation budget: {max_evaluations} simulator calls per run",
+        f"- Significance test: Mann-Whitney U, two-sided, exact "
+        f"(n={len({s.seed for s in summaries})} per group)",
+        f"- Optuna `n_startup_trials`: {N_STARTUP_TRIALS} — TPE samples this many "
+        "trials at random before its model takes over",
+        "",
+        "**Read the TPE line above carefully at small budgets.** At 20 evaluations "
+        f"it means {N_STARTUP_TRIALS} of the 20 are random search, so TPE is being "
+        "asked to work in a regime it is not designed for. That is deliberate and "
+        "was measured rather than assumed: lowering it to 3 or 5 makes TPE *worse* "
+        "at these budgets, because the estimator needs those observations to build "
+        "a density over. See the Phase 3.5 log.",
+        "",
+        "A rank test is used rather than a t-test because regret distributions here "
+        "are heavily right-skewed — one unlucky seed sits orders of magnitude above "
+        "the rest — which violates the normality a t-test assumes and would let a "
+        "single outlier drive the result.",
         "",
         "Every strategy receives the same benchmarks, the same seeds and the same",
         "number of simulator calls. Scores are **regret** — distance from the",

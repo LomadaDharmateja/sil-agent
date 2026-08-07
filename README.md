@@ -46,10 +46,14 @@ Final regret over 5 seeds, 200 simulator calls per run, lower is better:
 | Random search | 0.153 ± 0.12 | 0.866 ± 0.42 | 547 ± 830 |
 | **Optuna TPE** | **0.0188 ± 0.024** | **0.152 ± 0.10** | **28.9 ± 33** |
 
-TPE is the number the agent has to beat. The [full report](reports/phase2-main/report.md)
-carries per-seed data, convergence plots and a measured **seed noise floor** — how far
-apart two five-seed means can be when nothing differs but the seeds, which is the bar
-any Phase 4 claim has to clear.
+TPE is the number to beat — **at 200 evaluations**, which is the regime it is
+built for and where the agent has not been measured. Any comparison has to name
+its budget, because these strategies do not rank the same at 20 as at 200.
+
+The [full report](reports/phase2-main/report.md) carries per-seed data,
+convergence plots and a measured **seed noise floor** — how far apart two
+five-seed means can be when nothing differs but the seeds, which is the bar any
+Phase 4 claim has to clear.
 
 ```bash
 python -m sil_agent.cli ablate --experiment phase2-main --seeds 5 --episodes 200
@@ -91,7 +95,7 @@ nothing in the prompt names the function. On those instances the same control
 opens with the four corners and the centre of the unit square instead of the
 published minima. It is searching, not reciting.
 
-The comparison that replaces it, on a **local 4B model** at 20 evaluations:
+The comparison that replaces it, on a **local 4B model** at **20 evaluations**:
 
 | Strategy | branin_i1 | hartmann6_i1 |
 |---|---|---|
@@ -103,9 +107,28 @@ The comparison that replaces it, on a **local 4B model** at 20 evaluations:
 The agent and its no-loop control have **separated** — in Phase 3 they were
 identical, because memorisation had saturated both. That gap is the loop.
 
-What the numbers do *not* say is equally on the record: on `hartmann6_i1` the
-lead over TPE is inside the measured seed noise floor, so no claim is made there.
-Details in the [Phase 3.5 log](docs/phases/phase-035.md).
+### What this is not
+
+**This is not "the agent beats TPE".** It is a claim about *sample efficiency
+under a tight budget*, and the budget is the whole point. Given 200 evaluations
+TPE reaches regret 0.0188 — an order of magnitude below anything the agent has
+been measured at. A Bayesian optimiser spends its early evaluations building a
+surrogate and only then exploits it; judging it at 20 evaluations is judging it
+before it has started.
+
+The [budget sweep](reports/phase35-sweep/sweep.md) runs both at 10, 20, 40 and 80
+evaluations with a rank test at each. The agent's lead is statistically supported
+only at 20 (p=0.016); by 40 the two distributions overlap (p=0.69). The medians
+cross near 37, but **no budget above the crossing shows a real difference** — so
+the finding is that the agent's edge *dissolves*, not that TPE overtakes. That
+sweep, not the single 20-evaluation column, is the honest summary.
+
+Two further limits are on the record rather than buried: on `hartmann6_i1` the
+lead over TPE sits inside the measured seed noise floor, so **no claim is made
+there**; and Optuna's `n_startup_trials` is 10, so at a 20-evaluation budget half
+of TPE's run is random sampling — stated in the report, and measured rather than
+assumed (lowering it makes TPE *worse*). Details in the
+[Phase 3.5 log](docs/phases/phase-035.md).
 
 ## Documentation
 

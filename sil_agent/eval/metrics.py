@@ -27,14 +27,18 @@ from __future__ import annotations
 
 import math
 import random
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from statistics import median
 from uuid import UUID
 
+from sil_agent.agent.critic import CRITIC_UNAVAILABLE
+from sil_agent.agent.replanner import REPLANNER_UNAVAILABLE
 from sil_agent.agent.state import (
     Direction,
     Episode,
+    ReplanAction,
     RunStatus,
     TerminationReason,
     ToolError,
@@ -77,6 +81,28 @@ class RunSummary:
     model_calls: int = 0
     compliant_calls: int = 0
     schema_failures: int = 0
+
+    # Reflection, from Phase 4. Zero for every strategy without a critic, which
+    # is how the report knows to omit the section entirely rather than print a
+    # table of dashes.
+    #
+    # `reflected_episodes` counts episodes carrying a real diagnosis;
+    # `reflection_failures` counts those where the critic or the replanner could
+    # not be reached. The two are separate because "the critic said nothing
+    # useful" and "the critic was down" are different findings, and collapsing
+    # them would let an infrastructure problem be read as a model weakness.
+    reflected_episodes: int = 0
+    reflection_failures: int = 0
+    mean_confidence: float | None = None
+    terminate_recommended: int = 0
+    action_counts: tuple[tuple[str, int], ...] = ()
+
+    # What reflection cost. An agent_full episode is three model calls to
+    # agent_no_reflection's one, for the same single simulator call, and at an
+    # equal *evaluation* budget that is invisible. It is printed next to the
+    # regret so a sample-efficiency result cannot be read as an efficiency one.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
     @property
     def is_complete(self) -> bool:
@@ -178,6 +204,67 @@ def _is_better(value: float, incumbent: float, direction: Direction) -> bool:
     return value > incumbent
 
 
+@dataclass(frozen=True)
+class ReflectionStats:
+    """What the critic and replanner did across one run.
+
+    All of it is read back out of the episodes table rather than accumulated
+    while running, for the same reason every other number here is: the episodes
+    are the durable record, and an analysis built on them can be regenerated
+    months later from the database alone.
+    """
+
+    reflected_episodes: int
+    failures: int
+    mean_confidence: float | None
+    terminate_recommended: int
+    action_counts: tuple[tuple[str, int], ...]
+
+
+def summarise_reflection(episodes: Sequence[Episode]) -> ReflectionStats:
+    """Count diagnoses, confidences and decisions over a run's episodes.
+
+    ``terminate_recommended`` is the number the Phase 4 loop exists to make
+    reportable. The replanner may recommend stopping and the loop does not obey
+    it — Rule 2, and the equal-evaluation-budget rule the ablation rests on — so
+    the recommendation is counted here instead. A rate is strictly more
+    informative than letting the run end early, because it is a measurement
+    rather than a confound in the thing being measured.
+    """
+    diagnosed = [
+        e
+        for e in episodes
+        if e.evaluation.diagnosis and not e.evaluation.diagnosis.startswith(CRITIC_UNAVAILABLE)
+    ]
+    failures = sum(
+        1
+        for e in episodes
+        if e.evaluation.diagnosis.startswith(CRITIC_UNAVAILABLE)
+        or e.decision.reason.startswith(REPLANNER_UNAVAILABLE)
+    )
+
+    confidences = [e.evaluation.confidence for e in diagnosed]
+    mean_confidence = sum(confidences) / len(confidences) if confidences else None
+
+    # Only decisions an actual replanner made. Every episode carries a
+    # `ReplanDecision`, and for a strategy with no replanner that is
+    # `placeholder()` — counting those would report a solid wall of EXPLORE for
+    # random search.
+    actions = Counter(
+        e.decision.action.value
+        for e in episodes
+        if e.evaluation.diagnosis and not e.decision.reason.startswith(REPLANNER_UNAVAILABLE)
+    )
+
+    return ReflectionStats(
+        reflected_episodes=len(diagnosed),
+        failures=failures,
+        mean_confidence=mean_confidence,
+        terminate_recommended=actions.get(ReplanAction.TERMINATE.value, 0),
+        action_counts=tuple(sorted(actions.items())),
+    )
+
+
 def summarise_run(stored: StoredRun, benchmark: Benchmark) -> RunSummary:
     """Reduce one stored run to its scores."""
     episodes = stored.state.history
@@ -206,15 +293,19 @@ def summarise_run(stored: StoredRun, benchmark: Benchmark) -> RunSummary:
     else:
         regret_curve = [None] * budget.max_evaluations
 
-    # Schema compliance, counted over calls that genuinely reached a provider.
+    # Schema compliance, counted over requests that genuinely reached a provider.
     #
-    # `cost.calls == 0` means the answer came from the replay cache, and
+    # A replay from the cache reports `calls == 0` and contributes nothing;
     # including replays would drive the rate to 100% the second time an
-    # experiment is run — measuring the cache rather than the model.
-    model_calls = sum(1 for e in episodes if e.cost.calls > 0)
-    compliant_calls = sum(
-        1 for e in episodes if e.cost.calls > 0 and e.cost.schema_compliant_first_try
-    )
+    # experiment is run, measuring the cache rather than the model.
+    #
+    # Counted per *request* rather than per episode, which is a Phase 4 change.
+    # Through Phase 3.5 an episode was exactly one model call and the two were
+    # interchangeable. An `agent_full` episode is three — planner, critic,
+    # replanner — so counting episodes would divide the real denominator by
+    # three and quietly inflate any compliance rate computed from it.
+    model_calls = sum(e.cost.model_requests for e in episodes)
+    compliant_calls = sum(e.cost.compliant_model_requests for e in episodes)
     # Calls that never produced schema-valid output at all. These raise before a
     # CostRecord exists, so they appear only as the episode's error.
     schema_failures = sum(
@@ -223,7 +314,16 @@ def summarise_run(stored: StoredRun, benchmark: Benchmark) -> RunSummary:
         if isinstance(e.result, ToolError) and e.result.kind == "LLMOutputError"
     )
 
+    reflection = summarise_reflection(episodes)
+
     return RunSummary(
+        reflected_episodes=reflection.reflected_episodes,
+        reflection_failures=reflection.failures,
+        mean_confidence=reflection.mean_confidence,
+        terminate_recommended=reflection.terminate_recommended,
+        action_counts=reflection.action_counts,
+        prompt_tokens=sum(e.cost.prompt_tokens for e in episodes),
+        completion_tokens=sum(e.cost.completion_tokens for e in episodes),
         run_id=stored.state.run_id,
         strategy=stored.strategy,
         simulator=stored.simulator,

@@ -215,3 +215,95 @@ def test_grid_search_exhaustion_is_recorded(repo: RunRepository):
     assert derive_termination(stored) is TerminationReason.EXHAUSTED
     # 100 ** (1/6) is 2.15, so two points per axis: 64 evaluations of 100.
     assert len(stored.state.history) == 64
+
+
+# ---------------------------------------------------------------------------
+# Run locking (Phase 4)
+# ---------------------------------------------------------------------------
+#
+# Phase 3 built `services/locks.py` for exactly the collision Phase 3.5 then
+# hit — a killed shell script whose child `ablate` process survived, followed
+# by a re-issued command, so two processes walked the same experiment. Nothing
+# was corrupted, because the `(run_id, idx)` natural key refused the duplicate
+# insert, but the loser had already paid for a simulation and a model call.
+#
+# These tests cover the wiring rather than Redis: `build_lock` is substituted,
+# so the suite still runs with nothing installed. The lock's own semantics —
+# SET NX EX, the compare-and-delete, the stale holder — are covered against a
+# fake Redis in `test_stagnation_and_locks.py`.
+
+
+class RecordingLock:
+    """A lock that records what the harness did with it."""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.acquired = False
+        self.released = False
+        self.renewals = 0
+
+    def acquire(self) -> None:
+        if not self.available:
+            from sil_agent.services.locks import LockUnavailable
+
+            raise LockUnavailable("held by another worker")
+        self.acquired = True
+
+    def renew(self) -> bool:
+        self.renewals += 1
+        return True
+
+    def release(self) -> None:
+        self.released = True
+
+
+def test_a_cell_held_by_another_worker_is_skipped_not_failed(repo: RunRepository, monkeypatch):
+    """The whole matrix must not stop because one cell is busy.
+
+    `RunLock.acquire` never blocks, so moving on is the cheap option — and the
+    right one, since a matrix is a list of independent cells.
+    """
+    lock = RecordingLock(available=False)
+    monkeypatch.setattr("sil_agent.eval.harness.build_lock", lambda run_id: lock)
+
+    spec = small_spec("locked-experiment")
+    cell = next(spec.cells())
+
+    outcome = execute_cell(cell, spec, repo)
+
+    assert outcome.status == "locked"
+    assert outcome.episodes_run == 0
+    assert repo.count_episodes(cell.run_id) == 0, "nothing was written"
+
+
+def test_the_lock_is_held_for_the_run_and_released_after(repo: RunRepository, monkeypatch):
+    lock = RecordingLock()
+    monkeypatch.setattr("sil_agent.eval.harness.build_lock", lambda run_id: lock)
+
+    spec = small_spec("locked-experiment")
+    cell = next(spec.cells())
+
+    outcome = execute_cell(cell, spec, repo)
+
+    assert outcome.status == "completed"
+    assert lock.acquired and lock.released
+    # One renewal per durably written episode: the lease is extended as work is
+    # committed, rather than a TTL being chosen long enough for the whole run.
+    assert lock.renewals == spec.max_evaluations
+
+
+def test_the_lock_is_released_even_when_the_loop_raises(repo: RunRepository, monkeypatch):
+    """A crashed worker must not leave the run locked until the TTL expires."""
+    lock = RecordingLock()
+    monkeypatch.setattr("sil_agent.eval.harness.build_lock", lambda run_id: lock)
+
+    def explode(**kwargs):
+        raise RuntimeError("loop exploded")
+
+    monkeypatch.setattr("sil_agent.eval.harness.run_loop", explode)
+
+    spec = small_spec("locked-experiment")
+    with pytest.raises(RuntimeError, match="loop exploded"):
+        execute_cell(next(spec.cells()), spec, repo)
+
+    assert lock.released

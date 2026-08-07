@@ -14,3 +14,6 @@ artifacts/
 .DS_Store
 .idea/
 .vscode/
+
+# Phase logs from long ablation runs, kept out of the repository.
+*.log

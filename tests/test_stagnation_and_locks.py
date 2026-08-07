@@ -19,12 +19,16 @@ from sil_agent.agent.goal_parser import (
     validate_goal,
 )
 from sil_agent.agent.stagnation import (
+    ConfidenceDecline,
     DiversityCollapse,
     NoImprovement,
+    RepeatedDiagnosis,
     check_all,
     default_detectors,
+    jaccard,
     max_pairwise_distance,
     normalise,
+    tokenise,
 )
 from sil_agent.agent.state import (
     Candidate,
@@ -166,6 +170,133 @@ def test_no_detectors_means_no_stagnation():
 
 
 # ---------------------------------------------------------------------------
+# The two detectors that needed a critic (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def diagnosed(idx: int, text: str, confidence: float) -> Episode:
+    return Episode(
+        idx=idx,
+        candidate=Candidate(params={"x1": float(idx), "x2": 1.0}, source=CandidateSource.PLANNER),
+        result=SimResult(
+            metrics={"objective": 1.0}, objective_value=1.0, feasible=True, wall_time_s=0.0
+        ),
+        evaluation=Evaluation(
+            improved=False,
+            delta_vs_best=0.0,
+            feasible=True,
+            diagnosis=text,
+            confidence=confidence,
+        ),
+        decision=ReplanDecision.placeholder(),
+        cost=CostRecord.zero(),
+        duration_ms=1,
+    )
+
+
+def test_confidence_decline_fires_when_the_critic_gives_up():
+    history = [
+        diagnosed(i, f"analysis {i}", confidence)
+        for i, confidence in enumerate([0.9, 0.85, 0.8, 0.4, 0.3, 0.2])
+    ]
+    verdict = ConfidenceDecline(window=6, min_drop=0.15).check(history, GOAL)
+
+    assert verdict.stuck
+    assert verdict.detector == "confidence_decline"
+    assert "0.85" in verdict.detail or "0.30" in verdict.detail
+
+
+def test_confidence_decline_tolerates_noise():
+    """Strict monotonicity would never fire on a real model.
+
+    A single 0.4 between two 0.3s is sampling noise at the second decimal, not
+    a recovery of confidence, and a detector reset by it is a detector that
+    never fires.
+    """
+    history = [
+        diagnosed(i, f"analysis {i}", confidence)
+        for i, confidence in enumerate([0.9, 0.8, 0.9, 0.4, 0.5, 0.3])
+    ]
+    assert ConfidenceDecline(window=6, min_drop=0.15).check(history, GOAL).stuck
+
+
+def test_confidence_decline_stays_quiet_while_confidence_holds():
+    history = [
+        diagnosed(i, f"analysis {i}", confidence)
+        for i, confidence in enumerate([0.5, 0.6, 0.5, 0.6, 0.5, 0.6])
+    ]
+    assert not ConfidenceDecline(window=6, min_drop=0.15).check(history, GOAL).stuck
+
+
+def test_confidence_decline_ignores_episodes_with_no_diagnosis():
+    """A baseline's confidence is 0.0 by default, and means nothing.
+
+    Letting those into the window would make "this strategy has no critic"
+    indistinguishable from "this critic has given up".
+    """
+    history = [evaluated(i, float(i), 1.0, improved=False) for i in range(20)]
+    assert not ConfidenceDecline(window=6).check(history, GOAL).stuck
+
+
+def test_repeated_diagnosis_fires_on_reworded_boilerplate():
+    """The failure mode the Phase 4 brief expects most.
+
+    Fluent, plausible, identical analysis of every result. Nothing else in the
+    system notices: the episodes look healthy and the JSON validates.
+    """
+    history = [
+        diagnosed(0, "The objective rose, suggesting this region is less promising.", 0.5),
+        diagnosed(1, "The objective rose, suggesting the region is less promising.", 0.5),
+        diagnosed(2, "Objective rose, which suggests this region is promising less.", 0.5),
+        diagnosed(3, "The objective rose and suggests this region is less promising.", 0.5),
+    ]
+    verdict = RepeatedDiagnosis(window=4, threshold=0.75).check(history, GOAL)
+
+    assert verdict.stuck
+    assert verdict.detector == "repeated_diagnosis"
+
+
+def test_repeated_diagnosis_stays_quiet_on_genuinely_different_analysis():
+    history = [
+        diagnosed(0, "Raising x1 past 5 pushed the objective up sharply.", 0.5),
+        diagnosed(1, "The valley appears to run diagonally; x2 matters more here.", 0.5),
+        diagnosed(2, "Both corners evaluated badly, so the minimum is interior.", 0.5),
+        diagnosed(3, "Progress has stalled because every proposal crowds one point.", 0.5),
+    ]
+    assert not RepeatedDiagnosis(window=4, threshold=0.75).check(history, GOAL).stuck
+
+
+def test_repeated_diagnosis_ignores_the_numbers_that_change():
+    """Two diagnoses differing only in the values they quote are one thought."""
+    first = tokenise("objective fell from 6.1 to 5.8 near x1 equals 3")
+    second = tokenise("objective fell from 5.8 to 5.5 near x1 equals 4")
+
+    assert jaccard(first, second) == 1.0
+
+
+def test_repeated_diagnosis_does_not_fire_on_an_empty_diagnosis():
+    """A critic that said "ok" four times has no measurable similarity.
+
+    Treating an empty token set as identical would fire the detector on a
+    critic that said nothing, which is a different problem with a different fix.
+    """
+    history = [diagnosed(i, "ok", 0.5) for i in range(4)]
+    assert not RepeatedDiagnosis(window=4).check(history, GOAL).stuck
+
+
+def test_the_critic_detectors_never_fire_on_a_baseline():
+    """The full set is safe to hand any strategy.
+
+    On a run with no critic every diagnosis is empty, so both detectors return
+    "moving" without ever being able to fire.
+    """
+    history = [evaluated(i, 3.0 + i * 0.5, 2.0, improved=True) for i in range(30)]
+
+    for detector in (ConfidenceDecline(), RepeatedDiagnosis()):
+        assert not detector.check(history, GOAL).stuck
+
+
+# ---------------------------------------------------------------------------
 # Locking
 # ---------------------------------------------------------------------------
 
@@ -254,6 +385,60 @@ def test_tokens_are_unique_and_traceable():
     first, second = make_token(), make_token()
     assert first != second
     assert ":" in first, "host:pid:random, so a stuck lock can be traced to a process"
+
+
+# ---------------------------------------------------------------------------
+# The heartbeat (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_losing_the_lock_mid_run_stops_the_worker():
+    """A lost lease means another worker may already own this run.
+
+    Continuing would be the exact double-writing the lock exists to prevent, so
+    the loop stops immediately — with everything written so far safely
+    committed, because the heartbeat is checked *after* the episode insert.
+    """
+    from sil_agent.agent.loop import run_loop
+    from sil_agent.strategies.random_search import RandomSearch
+    from tests.conftest import make_run_state
+    from tests.test_loop_termination import InMemoryRepository
+
+    beats = {"count": 0}
+
+    def heartbeat() -> bool:
+        beats["count"] += 1
+        return beats["count"] < 3  # the lease is lost after the third episode
+
+    repo = InMemoryRepository()
+    result = run_loop(
+        state=make_run_state(episodes=10),
+        simulator=ToySimulator.from_name("branin"),
+        strategy=RandomSearch(),
+        repo=repo,
+        heartbeat=heartbeat,
+    )
+
+    assert result.reason.value == "ERROR"
+    assert result.episodes_run == 3
+    assert len(repo.episodes) == 3, "the work done before the lease was lost is committed"
+
+
+def test_a_healthy_heartbeat_does_not_interfere():
+    from sil_agent.agent.loop import run_loop
+    from sil_agent.strategies.random_search import RandomSearch
+    from tests.conftest import make_run_state
+    from tests.test_loop_termination import InMemoryRepository
+
+    result = run_loop(
+        state=make_run_state(episodes=5),
+        simulator=ToySimulator.from_name("branin"),
+        strategy=RandomSearch(),
+        repo=InMemoryRepository(),
+        heartbeat=lambda: True,
+    )
+
+    assert result.episodes_run == 5
 
 
 # ---------------------------------------------------------------------------

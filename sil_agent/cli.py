@@ -32,6 +32,7 @@ from sil_agent.eval import sweep as sweep_module
 from sil_agent.eval.harness import ExperimentSpec, execute
 from sil_agent.persistence.db import make_session_factory, resolve_database_url
 from sil_agent.persistence.repo import RunRepository
+from sil_agent.services.locks import LockUnavailable, build_lock
 from sil_agent.services.replay import CachingRouter
 from sil_agent.services.router import ModelRouter, build_default_router
 from sil_agent.simulators.toy import BENCHMARKS, ToySimulator
@@ -203,14 +204,30 @@ def command_resume(args: argparse.Namespace) -> int:
     print(f"resuming at episode {state.step_idx} of {state.budget.max_evaluations}")
     print(flush=True)
 
-    result = run_loop(
-        state=state,
-        simulator=simulator,
-        strategy=strategy,
-        repo=repo,
-        on_episode=_print_episode,
-        crash_at=args.crash_at,
-    )
+    # Locked, unlike `run`. A fresh run invents its own uuid4 and cannot
+    # collide with anything; `resume` names an existing run explicitly, which
+    # makes "issue the same resume command twice" both easy and the exact
+    # collision the lock exists for.
+    lock = build_lock(state.run_id)
+    try:
+        lock.acquire()
+    except LockUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        result = run_loop(
+            state=state,
+            simulator=simulator,
+            strategy=strategy,
+            repo=repo,
+            on_episode=_print_episode,
+            crash_at=args.crash_at,
+            heartbeat=lock.renew,
+        )
+    finally:
+        lock.release()
+
     _report(result, repo)
     return 0
 
@@ -277,10 +294,20 @@ def command_ablate(args: argparse.Namespace) -> int:
     outcomes = execute(spec, repo)
 
     skipped = sum(1 for o in outcomes if o.status == "skipped")
+    locked = sum(1 for o in outcomes if o.status == "locked")
+    executed = len(outcomes) - skipped - locked
     episodes = sum(o.episodes_run for o in outcomes)
     print()
-    print(f"{len(outcomes)} runs: {skipped} already complete, {len(outcomes) - skipped} executed")
+    print(f"{len(outcomes)} runs: {skipped} already complete, {executed} executed")
     print(f"{episodes} episodes run this invocation")
+    if locked:
+        # Named rather than folded into "skipped": a locked cell is unfinished
+        # work that another process is doing, and re-issuing the command once
+        # that process is gone will pick it up. A skipped cell is done.
+        print(
+            f"{locked} run(s) were locked by another worker and left alone. "
+            "Re-issue this command once that worker has finished."
+        )
     print(f"\nnext: python -m sil_agent.cli report --experiment {spec.name}")
     return 0
 

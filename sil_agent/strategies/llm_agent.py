@@ -29,13 +29,21 @@ from __future__ import annotations
 import random
 from collections.abc import Sequence
 
+from sil_agent.agent.critic import (
+    CRITIC_UNAVAILABLE,
+    Critic,
+    CriticVerdict,
+    evaluation_from,
+)
 from sil_agent.agent.planner import (
     BatchProposal,
     Planner,
     describe_constraints,
     describe_objective,
+    describe_reflection,
     describe_space,
 )
+from sil_agent.agent.replanner import REPLANNER_UNAVAILABLE, Replanner
 from sil_agent.agent.state import (
     Best,
     Candidate,
@@ -43,12 +51,25 @@ from sil_agent.agent.state import (
     CostRecord,
     Direction,
     Episode,
+    Evaluation,
     Goal,
+    ReplanAction,
+    ReplanDecision,
     SimResult,
+    ToolError,
 )
 from sil_agent.prompts import load
+from sil_agent.services.retry import ProviderError
 from sil_agent.services.router import ModelRouter, Prompt, Role
-from sil_agent.strategies.base import StrategyExhausted
+from sil_agent.strategies.base import Reflection, StrategyExhausted
+
+# What the prompt-control arm puts where a review would go. See
+# ``AgentPromptControl`` for why it is a constant sentence rather than an empty
+# string.
+NO_REFLECTION_BLOCK = (
+    "No review is available for this run. Decide the direction yourself from the "
+    "results above."
+)
 
 
 def recompute_best(history: Sequence[Episode], goal: Goal) -> Best | None:
@@ -103,6 +124,183 @@ class AgentNoReflection:
         best = recompute_best(history, goal)
         candidate, cost = self._planner.propose(
             goal, history, best, max_evaluations=self._max_evaluations
+        )
+        self.last_cost = cost
+        return candidate
+
+
+class AgentFull:
+    """Planner + critic + replanner. The Phase 4 treatment.
+
+    The loop is the same loop. What changes is that this strategy also
+    implements ``Reflects``, so after each result the loop asks it to diagnose
+    what happened and choose a direction — and then stores both on the episode.
+
+    **The feedback path is the database, not this object.** ``propose`` reads
+    the previous episode's diagnosis and decision out of ``history`` and renders
+    them into the prompt. Nothing is carried on the instance between calls, so a
+    resumed run rebuilds exactly the prompt the interrupted one would have sent.
+    That is Rule 1, and it is the reason ``Episode.evaluation`` and
+    ``Episode.decision`` were put in the schema in Phase 1 rather than added
+    here.
+
+    **What it costs.** Three model calls per episode against
+    ``AgentNoReflection``'s one, for the same single simulator call. At an equal
+    *evaluation* budget that is invisible, which is correct for a project whose
+    premise is that a simulator call costs minutes and a token costs nothing —
+    but it means any win here is a claim about sample efficiency and not about
+    efficiency in general. The report prints the call and token counts next to
+    the regret so the two cannot be confused.
+    """
+
+    def __init__(
+        self,
+        router: ModelRouter,
+        *,
+        max_evaluations: int,
+        prompt_version: str = "v2",
+        critic_version: str = "v1",
+        replanner_version: str = "v1",
+    ) -> None:
+        # v2 is v1 plus a reflection block. v1 is deliberately left alone: it is
+        # what the control uses, and editing it would both change the control
+        # mid-experiment and orphan every recorded Phase 3.5 call.
+        self._planner = Planner(router, prompt_version=prompt_version)
+        self._critic = Critic(router, prompt_version=critic_version)
+        self._replanner = Replanner(router, prompt_version=replanner_version)
+        self._max_evaluations = max_evaluations
+        self.last_cost: CostRecord = CostRecord.zero()
+
+    @property
+    def name(self) -> str:
+        return "agent_full"
+
+    def propose(
+        self,
+        goal: Goal,
+        history: list[Episode],
+        rng: random.Random,
+    ) -> Candidate:
+        """``rng`` is unused: the randomness lives in the model, not here."""
+        best = recompute_best(history, goal)
+        candidate, cost = self._planner.propose(
+            goal,
+            history,
+            best,
+            max_evaluations=self._max_evaluations,
+            reflection_block=describe_reflection(history),
+        )
+        self.last_cost = cost
+        return candidate
+
+    def reflect(
+        self,
+        goal: Goal,
+        history: Sequence[Episode],
+        candidate: Candidate,
+        outcome: SimResult | ToolError,
+        computed: Evaluation,
+        best: Best | None,
+    ) -> Reflection:
+        """Diagnose the result, then choose a direction.
+
+        Never raises for an ordinary model failure. The simulator call behind
+        this result has already been paid for, and losing the episode because
+        the *narration* failed would be the most expensive possible response —
+        so a failure is recorded in the returned ``Reflection`` and the loop
+        writes the episode with the computed evaluation it already had.
+        """
+        cost = CostRecord.zero()
+
+        try:
+            verdict, critic_cost = self._critic.evaluate(
+                goal, history, candidate, outcome, computed, best
+            )
+        except ProviderError as exc:
+            # No diagnosis means nothing for the replanner to reason over, so
+            # its call is skipped rather than spent on an empty input.
+            return Reflection(
+                verdict=CriticVerdict(diagnosis=f"{CRITIC_UNAVAILABLE}: {exc}"),
+                decision=ReplanDecision(
+                    action=ReplanAction.EXPLORE,
+                    reason="no diagnosis available; defaulting to exploration",
+                ),
+                cost=cost,
+                failure=f"critic: {exc}",
+            )
+        cost = cost.plus(critic_cost)
+
+        # The replanner reasons over the *joined* evaluation — the oracle's
+        # numbers and the critic's words — which is exactly what will be stored
+        # on the episode. Building it here rather than passing the verdict alone
+        # means the replanner sees what the next planner will see.
+        evaluation = evaluation_from(computed, verdict)
+
+        try:
+            decision, replan_cost = self._replanner.decide(
+                goal, history, evaluation, best, max_evaluations=self._max_evaluations
+            )
+        except ProviderError as exc:
+            return Reflection(
+                verdict=verdict,
+                decision=ReplanDecision(
+                    action=ReplanAction.EXPLORE,
+                    reason=f"{REPLANNER_UNAVAILABLE}: {exc}",
+                ),
+                cost=cost,
+                failure=f"replanner: {exc}",
+            )
+
+        return Reflection(verdict=verdict, decision=decision, cost=cost.plus(replan_cost))
+
+
+class AgentPromptControl:
+    """`AgentFull`'s prompt, without reflection. The confound control.
+
+    ``AgentFull`` differs from ``AgentNoReflection`` in two ways at once: it
+    receives reflection content, and it receives a differently worded prompt
+    (``planner.v2`` rather than ``v1``). A win could be either, and an ablation
+    that cannot separate them is not measuring what it claims to.
+
+    This arm holds the prompt constant and removes only the content: v2's
+    template, no critic, no replanner, and a fixed sentence where the review
+    would be. If it matches ``AgentNoReflection``, the rewording is inert and
+    any ``AgentFull`` difference is reflection. If it does not, the headline has
+    to be widened to "reflection and the prompt that carries it".
+
+    The stand-in is a sentence rather than an empty string on purpose. An empty
+    section would leave v2's sixth rule referring to nothing, which is a third
+    difference rather than a control for the second.
+    """
+
+    def __init__(
+        self,
+        router: ModelRouter,
+        *,
+        max_evaluations: int,
+        prompt_version: str = "v2",
+    ) -> None:
+        self._planner = Planner(router, prompt_version=prompt_version)
+        self._max_evaluations = max_evaluations
+        self.last_cost: CostRecord = CostRecord.zero()
+
+    @property
+    def name(self) -> str:
+        return "agent_prompt_control"
+
+    def propose(
+        self,
+        goal: Goal,
+        history: list[Episode],
+        rng: random.Random,
+    ) -> Candidate:
+        best = recompute_best(history, goal)
+        candidate, cost = self._planner.propose(
+            goal,
+            history,
+            best,
+            max_evaluations=self._max_evaluations,
+            reflection_block=NO_REFLECTION_BLOCK,
         )
         self.last_cost = cost
         return candidate

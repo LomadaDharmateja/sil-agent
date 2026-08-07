@@ -28,7 +28,12 @@ from uuid import UUID
 from sil_agent.services.router import ModelRouter
 from sil_agent.strategies.base import Strategy
 from sil_agent.strategies.grid import GridSearch
-from sil_agent.strategies.llm_agent import AgentNoReflection, SingleShotLLM
+from sil_agent.strategies.llm_agent import (
+    AgentFull,
+    AgentNoReflection,
+    AgentPromptControl,
+    SingleShotLLM,
+)
 from sil_agent.strategies.optuna_tpe import OptunaTPE
 from sil_agent.strategies.random_search import RandomSearch
 
@@ -54,9 +59,14 @@ class StrategyContext:
         return self.router_factory()
 
 
-# name -> factory. Phase 4 adds "agent_full" here, and nothing else in the
-# harness, the CLI or the report has to change — which is the point of routing
-# every strategy through one protocol.
+# name -> factory.
+#
+# Phase 4 added "agent_full" and "agent_prompt_control" here and changed nothing
+# else in the harness, the CLI or the report — which is the point of routing
+# every strategy through one protocol. Note in particular that neither the
+# harness nor the CLI has any notion of "this one reflects": `run_loop` decides
+# that with `isinstance(strategy, Reflects)`, so this dictionary stays the single
+# source of truth for what a strategy is.
 STRATEGY_FACTORIES: dict[str, Callable[[StrategyContext], Strategy]] = {
     "random_search": lambda _: RandomSearch(),
     "grid_search": lambda ctx: GridSearch(ctx.max_evaluations),
@@ -67,13 +77,28 @@ STRATEGY_FACTORIES: dict[str, Callable[[StrategyContext], Strategy]] = {
     "agent_no_reflection": lambda ctx: AgentNoReflection(
         ctx.router(), max_evaluations=ctx.max_evaluations
     ),
+    "agent_full": lambda ctx: AgentFull(ctx.router(), max_evaluations=ctx.max_evaluations),
+    # The confound control: agent_full's prompt, no reflection. See
+    # `strategies/llm_agent.py`. Runs in its own experiment rather than the main
+    # matrix, because the report's validated colour palette has six slots and
+    # refuses a seventh rather than reusing a hue.
+    "agent_prompt_control": lambda ctx: AgentPromptControl(
+        ctx.router(), max_evaluations=ctx.max_evaluations
+    ),
 }
 
 STRATEGY_NAMES: list[str] = sorted(STRATEGY_FACTORIES)
 
 # The subset that needs a provider. Used by the harness and CLI to fail early
 # with a clear message rather than partway through a matrix.
-LLM_STRATEGIES: frozenset[str] = frozenset({"single_shot_llm", "agent_no_reflection"})
+LLM_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "single_shot_llm",
+        "agent_no_reflection",
+        "agent_full",
+        "agent_prompt_control",
+    }
+)
 
 
 def build_strategy(

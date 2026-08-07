@@ -1,10 +1,21 @@
 """The loop.
 
-The structure is TECHNICAL_DESIGN §3 with the LLM steps stubbed: a strategy
-proposes instead of a planner, and the critic and replanner are placeholders
-carrying computed values and no prose.
+The structure is TECHNICAL_DESIGN §3, complete from Phase 4: a strategy
+proposes, the guard validates, the simulator decides, and — for a strategy that
+implements ``Reflects`` — a critic explains the result and a replanner chooses
+what to do next. A strategy that does not implement it stores the computed
+evaluation and a placeholder decision, exactly as every strategy did through
+Phase 3.5. The loop never learns what a critic is; it asks
+``isinstance(strategy, Reflects)`` and nothing more.
 
-Everything interesting in this file is about one property — **durable
+**Where Rule 2 lives in this file.** ``improved``, ``delta_vs_best`` and
+``feasible`` are computed here from oracle output and passed *into* the critic.
+The critic's schema does not contain them, and the stored ``Evaluation`` is
+assembled by ``evaluation_from`` out of the oracle's numbers and the model's
+words. There is no path by which a model's opinion reaches a computed field, and
+that is a property of the types rather than of the prompt.
+
+Everything else interesting in this file is about one property — **durable
 execution**. Kill the process at any instant and a later ``resume`` continues
 exactly where it left off, with no episode lost and none run twice.
 
@@ -38,6 +49,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
+from sil_agent.agent.critic import CRITIC_UNAVAILABLE, evaluation_from
 from sil_agent.agent.guards import GuardRejection, is_duplicate, perturb, validate
 from sil_agent.agent.stagnation import StagnationDetector, check_all
 from sil_agent.agent.state import (
@@ -50,6 +62,7 @@ from sil_agent.agent.state import (
     Evaluation,
     Goal,
     Objective,
+    ReplanAction,
     ReplanDecision,
     RunState,
     RunStatus,
@@ -59,7 +72,7 @@ from sil_agent.agent.state import (
 )
 from sil_agent.services.retry import ProviderError
 from sil_agent.simulators.base import Simulator
-from sil_agent.strategies.base import ReportsCost, Strategy, StrategyExhausted
+from sil_agent.strategies.base import Reflects, ReportsCost, Strategy, StrategyExhausted
 
 
 def episode_rng(seed: int, idx: int) -> random.Random:
@@ -211,6 +224,12 @@ class LoopResult:
 # progress; keeping it a callback keeps printing out of the loop's logic.
 EpisodeCallback = Callable[[RunState, Episode], None]
 
+# Called after each episode is durably written, to say whether this worker still
+# owns the run. The harness passes ``RunLock.renew``. Returning False means the
+# lease was lost and another worker may already be writing, so this one must
+# stop immediately — see ``eval/harness.py``.
+Heartbeat = Callable[[], bool]
+
 
 def run_loop(
     *,
@@ -221,6 +240,8 @@ def run_loop(
     on_episode: EpisodeCallback | None = None,
     crash_at: int | None = None,
     detectors: Sequence[StagnationDetector] | None = None,
+    heartbeat: Heartbeat | None = None,
+    honour_terminate: bool = False,
 ) -> LoopResult:
     """Run episodes until a termination condition fires.
 
@@ -232,6 +253,19 @@ def run_loop(
     the worst possible moment, after the simulation has been paid for but
     before anything records it. It exists so the durability claim can be tested
     automatically rather than only by hand.
+
+    ``honour_terminate`` decides whether a replanner recommending ``TERMINATE``
+    actually stops the run. **It defaults to off, and the ablation runs with it
+    off.** Two reasons, and the second is the operative one:
+
+    * Rule 2 — termination is a decision, and deterministic code decides.
+    * Fairness — the evaluation budget has to buy the same number of simulator
+      calls for every strategy (``TECHNICAL_DESIGN.md`` §6). A strategy that
+      talks itself into quitting at evaluation six has not lost the same contest
+      the others were in, it has set its own budget.
+
+    The recommendation is recorded on the episode either way, and the report
+    prints the rate. A number is strictly more informative than a confound.
     """
     state = rehydrate(state)
     goal = state.goal
@@ -350,14 +384,52 @@ def run_loop(
         # was paid for whether or not it produced anything usable.
         cost = strategy.last_cost if isinstance(strategy, ReportsCost) else CostRecord.zero()
 
+        # The computed verdict. These three numbers are the oracle's, and from
+        # here they are passed *into* the critic rather than asked of it.
+        computed = Evaluation.computed_only(
+            improved=improved, delta_vs_best=delta, feasible=feasible
+        )
+        evaluation = computed
+        decision = ReplanDecision.placeholder()
+
+        # ---- reflection (Phase 4) -----------------------------------------
+        #
+        # Optional, exactly like ReportsCost above: a strategy that does not
+        # implement the protocol stores the computed evaluation and a
+        # placeholder decision, which is what every strategy did through Phase
+        # 3.5. The loop never learns what a critic is.
+        if isinstance(strategy, Reflects):
+            try:
+                reflection = strategy.reflect(
+                    goal, state.history, candidate, outcome, computed, state.best
+                )
+            except Exception as exc:
+                # A backstop, not the ordinary path — a well-behaved reflector
+                # reports model failures through `Reflection.failure` and keeps
+                # its partial cost. Either way the simulation has already been
+                # paid for, and losing the episode to a failure in the narration
+                # would be the most expensive possible response to it.
+                evaluation = Evaluation(
+                    improved=improved,
+                    delta_vs_best=delta,
+                    feasible=feasible,
+                    diagnosis=f"{CRITIC_UNAVAILABLE}: {type(exc).__name__}: {exc}",
+                )
+            else:
+                # The one place the two halves are joined. `evaluation_from`
+                # takes the computed fields from `computed` and only the prose
+                # from the verdict, so a reflector cannot revise a grade.
+                evaluation = evaluation_from(computed, reflection.verdict)
+                decision = reflection.decision
+                cost = cost.plus(reflection.cost)
+        # -------------------------------------------------------------------
+
         episode = Episode(
             idx=idx,
             candidate=candidate,
             result=outcome,
-            evaluation=Evaluation.computed_only(
-                improved=improved, delta_vs_best=delta, feasible=feasible
-            ),
-            decision=ReplanDecision.placeholder(),
+            evaluation=evaluation,
+            decision=decision,
             cost=cost,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
@@ -372,9 +444,14 @@ def run_loop(
         # ---- commit point -------------------------------------------------
         inserted = repo.append_episode(state.run_id, episode)
         if not inserted:
+            # Phase 4 wired the Redis lock into the harness, so two workers
+            # should no longer reach this line. It stays, and stays
+            # load-bearing: a lock has a TTL and a stalled worker can outlive
+            # its lease, whereas the natural key on (run_id, idx) cannot be
+            # outlived. The lock removes the waste; this removes the corruption.
             print(
                 f"episode {idx} of run {state.run_id} already exists - another process is "
-                "writing to this run. Stopping. (Run locking arrives in Phase 3.)",
+                "writing to this run. Stopping.",
                 file=sys.stderr,
             )
             reason = TerminationReason.ERROR
@@ -401,6 +478,26 @@ def run_loop(
         episodes_run += 1
         if on_episode is not None:
             on_episode(state, episode)
+
+        # Extend the lease, now that an episode is durably written. Placed after
+        # the commit rather than before it so a lost lock is discovered with the
+        # work safely recorded — and placed at all because an agent_full episode
+        # is three model calls, which is long enough for a fixed TTL to be the
+        # wrong tool.
+        if heartbeat is not None and not heartbeat():
+            print(
+                f"run {state.run_id}: lost the run lock after episode {idx}. Another "
+                "worker may now own this run, so this one stops writing.",
+                file=sys.stderr,
+            )
+            reason = TerminationReason.ERROR
+            break
+
+        # The replanner asked to stop. Off by default — see the docstring.
+        if honour_terminate and decision.action is ReplanAction.TERMINATE:
+            reason = TerminationReason.STAGNATION
+            stagnation_detail = f"replanner recommended TERMINATE: {decision.reason}"
+            break
 
     final_status = RunStatus.FAILED if reason is TerminationReason.ERROR else RunStatus.DONE
     state = state.with_status(final_status)

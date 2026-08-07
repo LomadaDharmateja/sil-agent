@@ -13,7 +13,7 @@ benchmark.
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -527,6 +527,100 @@ def compliance_table(summaries: Sequence[RunSummary]) -> str:
     return "\n".join(lines)
 
 
+def reflection_table(summaries: Sequence[RunSummary]) -> str:
+    """What the critic and the replanner actually did.
+
+    Empty for an experiment with no reflecting strategy, so the section is
+    omitted rather than printed as a table of dashes.
+
+    The `TERMINATE` column is the one worth reading closely. The replanner may
+    recommend stopping and **the loop does not obey it** — termination is
+    deterministic code's decision (Rule 2), and letting a strategy set its own
+    budget would break the equal-evaluations rule the whole comparison rests on.
+    So the recommendation is counted rather than acted on, which turns a
+    potential confound into a measurement.
+    """
+    reflecting = [s for s in summaries if s.reflected_episodes or s.reflection_failures]
+    if not reflecting:
+        return ""
+
+    by_strategy: dict[str, list[RunSummary]] = defaultdict(list)
+    for summary in reflecting:
+        by_strategy[summary.strategy].append(summary)
+
+    lines = [
+        "| Strategy | Runs | Episodes diagnosed | Mean confidence | Decisions "
+        "| TERMINATE recommended | Reflection failures |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for strategy in sorted(by_strategy):
+        runs = by_strategy[strategy]
+        diagnosed = sum(r.reflected_episodes for r in runs)
+        failures = sum(r.reflection_failures for r in runs)
+
+        confidences = [r.mean_confidence for r in runs if r.mean_confidence is not None]
+        confidence = f"{sum(confidences) / len(confidences):.2f}" if confidences else "—"
+
+        actions: Counter[str] = Counter()
+        for run in runs:
+            for action, count in run.action_counts:
+                actions[action] += count
+        distribution = (
+            ", ".join(f"{name} {count}" for name, count in sorted(actions.items())) or "—"
+        )
+
+        terminate = sum(r.terminate_recommended for r in runs)
+        share = f"{terminate} ({terminate / diagnosed:.0%})" if diagnosed else str(terminate)
+
+        lines.append(
+            f"| {strategy} | {len(runs)} | {diagnosed} | {confidence} | "
+            f"{distribution} | {share} | {failures} |"
+        )
+
+    return "\n".join(lines)
+
+
+def reflection_cost_table(summaries: Sequence[RunSummary]) -> str:
+    """What each strategy spent to get its regret.
+
+    **This table is what keeps the headline honest.** An `agent_full` episode is
+    three model calls where `agent_no_reflection`'s is one, for the same single
+    simulator call. The ablation holds the *evaluation* budget equal, which is
+    the right thing to hold equal for a project whose premise is that a simulator
+    call costs minutes and a token costs nothing — but it means any win here is a
+    claim about sample efficiency and not about efficiency in general.
+
+    Printing the cost next to the result is the cheapest possible defence
+    against that being misread, and Phase 3.5 had to retrofit exactly this kind
+    of rescoping after publishing.
+    """
+    spending = [s for s in summaries if s.model_calls or s.schema_failures]
+    if not spending:
+        return ""
+
+    by_strategy: dict[str, list[RunSummary]] = defaultdict(list)
+    for summary in spending:
+        by_strategy[summary.strategy].append(summary)
+
+    lines = [
+        "| Strategy | Runs | Model requests | Requests per evaluation "
+        "| Prompt tokens | Completion tokens |",
+        "|---|---|---|---|---|---|",
+    ]
+    for strategy in sorted(by_strategy):
+        runs = by_strategy[strategy]
+        requests = sum(r.model_calls for r in runs)
+        evaluations = sum(r.evaluations for r in runs)
+        per_eval = f"{requests / evaluations:.2f}" if evaluations else "—"
+        lines.append(
+            f"| {strategy} | {len(runs)} | {requests} | {per_eval} | "
+            f"{sum(r.prompt_tokens for r in runs):,} | "
+            f"{sum(r.completion_tokens for r in runs):,} |"
+        )
+
+    return "\n".join(lines)
+
+
 def per_seed_table(summaries: Sequence[RunSummary]) -> str:
     """Every raw number. The answer to "are you sure you didn't pick a good seed?"."""
     lines = ["| Strategy | Benchmark | Seed | Evaluations | Best feasible | Regret | Terminated |"]
@@ -670,6 +764,46 @@ def build(
         comparison_table(cells, strategies, simulators),
         "",
     ]
+
+    reflection = reflection_table(summaries)
+    if reflection:
+        sections += [
+            "## Reflection — what the critic and replanner did",
+            "",
+            "Counted from the episodes table. `Episodes diagnosed` excludes episodes",
+            "where the critic could not be reached; those are counted separately as",
+            "`Reflection failures`, because *the critic said nothing useful* and *the",
+            "critic was down* are different findings.",
+            "",
+            reflection,
+            "",
+            "**`TERMINATE recommended` was recorded and not obeyed.** The replanner may",
+            "recommend stopping; the loop does not stop. Termination is deterministic",
+            "code's decision (Rule 2), and a strategy allowed to end its own run early",
+            "would not be sitting the same exam as the others — the evaluation budget",
+            "being identical across strategies is the single property this comparison",
+            "rests on. The recommendation is therefore a number in this table rather",
+            "than a confound in the one above it.",
+            "",
+        ]
+
+    reflection_cost = reflection_cost_table(summaries)
+    if reflection_cost:
+        sections += [
+            "## What reflection cost",
+            "",
+            "Read this next to the headline. A reflecting episode is three model",
+            "requests — planner, critic, replanner — against one for a planner-only",
+            "agent, for the *same single simulator call*. This ablation holds the",
+            "evaluation budget equal, which is the right thing to hold equal when the",
+            "premise is that a simulator call costs minutes and a token costs nothing.",
+            "",
+            "But it means any advantage shown above is **sample efficiency**, not",
+            "efficiency in general. If evaluations are cheap, this trade is a bad one.",
+            "",
+            reflection_cost,
+            "",
+        ]
 
     compliance = compliance_table(summaries)
     if compliance:

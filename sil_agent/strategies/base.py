@@ -20,9 +20,22 @@ identical sequence" true rather than nearly true.
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from sil_agent.agent.state import Candidate, CostRecord, Episode, Goal
+from sil_agent.agent.critic import CriticVerdict
+from sil_agent.agent.state import (
+    Best,
+    Candidate,
+    CostRecord,
+    Episode,
+    Evaluation,
+    Goal,
+    ReplanDecision,
+    SimResult,
+    ToolError,
+)
 
 
 class StrategyExhausted(Exception):
@@ -84,3 +97,62 @@ class ReportsCost(Protocol):
 
     @property
     def last_cost(self) -> CostRecord: ...
+
+
+@dataclass(frozen=True)
+class Reflection:
+    """What a reflecting strategy produces after seeing one result.
+
+    ``verdict`` carries only the model's prose. The computed fields —
+    ``improved``, ``delta_vs_best``, ``feasible`` — are absent from
+    :class:`~sil_agent.agent.critic.CriticVerdict` by design, and the loop
+    assembles the stored ``Evaluation`` from the oracle's numbers and this
+    verdict's words. A reflector has no channel through which to change a grade.
+    """
+
+    verdict: CriticVerdict
+    decision: ReplanDecision
+    cost: CostRecord
+    # Set when reflection did not complete — the critic or the replanner failed.
+    # Recorded rather than raised: the simulator call has already been paid for
+    # and the episode must still be written. Counted in the report, so a run
+    # whose critic was down is distinguishable from one that never had a critic.
+    failure: str | None = None
+
+
+@runtime_checkable
+class Reflects(Protocol):
+    """A strategy that diagnoses its own results and re-plans from the diagnosis.
+
+    Optional and separate from ``Strategy`` for exactly the reason
+    ``ReportsCost`` is: random search does not reflect and should not have to
+    implement a method saying so. The loop checks for this at runtime and stores
+    the computed-only evaluation plus a placeholder decision when it is absent —
+    which is precisely what Phases 1 to 3.5 did for every strategy.
+
+    Keeping it here rather than adding a flag to the harness means
+    ``build_strategy(name)`` stays the single source of truth for what a
+    strategy is. A second switch elsewhere is how a run ends up labelled
+    ``agent_full`` while quietly not reflecting.
+    """
+
+    def reflect(
+        self,
+        goal: Goal,
+        history: Sequence[Episode],
+        candidate: Candidate,
+        outcome: SimResult | ToolError,
+        computed: Evaluation,
+        best: Best | None,
+    ) -> Reflection:
+        """Diagnose ``outcome`` and choose what to do next.
+
+        ``computed`` is the oracle's verdict, passed *in*: the reflector is told
+        whether the result improved and by how much, and its prompt renders
+        those as facts to be explained. ``history`` is every episode before this
+        one, and ``best`` the incumbent it was compared against.
+
+        Must not raise for an ordinary model failure — return a ``Reflection``
+        with ``failure`` set instead, so the episode is still written.
+        """
+        ...

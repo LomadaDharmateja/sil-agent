@@ -441,6 +441,19 @@ class CostRecord(Frozen):
     # Defaulted, so episodes written before this field existed still load.
     repair_attempts: int = Field(default=0, ge=0)
 
+    # How many *logical* model requests this record represents, and how many of
+    # them validated first time.
+    #
+    # Added in Phase 4, when one episode stopped being one model call. An
+    # `agent_full` episode asks the planner, the critic and the replanner, so
+    # `calls` — which counts provider generations including repair attempts —
+    # can no longer stand in for "how many times was the model asked something".
+    # Phase 3.5's compliance rate counted one call per episode and was right by
+    # accident; at three calls per episode it would have been wrong by a factor
+    # of three.
+    requests: int = Field(default=0, ge=0)
+    compliant_requests: int = Field(default=0, ge=0)
+
     @property
     def schema_compliant_first_try(self) -> bool:
         """Whether the model got it right without being corrected.
@@ -450,6 +463,53 @@ class CostRecord(Frozen):
         100% on the second run of an experiment.
         """
         return self.repair_attempts == 0
+
+    @property
+    def model_requests(self) -> int:
+        """Logical model requests behind this episode, across schema versions.
+
+        Episodes written before Phase 4 have no ``requests`` field and default
+        to zero, so they fall back to the shape that was true when they were
+        written: one request per episode that actually reached a provider. That
+        keeps a Phase 3 or Phase 3.5 report regenerating to the same numbers it
+        originally published, which is the whole point of building the analysis
+        on the episodes table rather than on a log.
+        """
+        if self.requests:
+            return self.requests
+        return 1 if self.calls > 0 else 0
+
+    @property
+    def compliant_model_requests(self) -> int:
+        """Of ``model_requests``, how many validated on the first attempt."""
+        if self.requests:
+            return self.compliant_requests
+        return 1 if self.calls > 0 and self.repair_attempts == 0 else 0
+
+    def plus(self, other: CostRecord) -> CostRecord:
+        """Combine two records into one episode's total.
+
+        Needed from Phase 4: an episode's cost is the planner's call plus the
+        critic's plus the replanner's, and the loop stores one CostRecord per
+        episode. Addition rather than mutation, like everything else here.
+
+        ``model`` keeps the first one set. The field is a label for the report,
+        and in every configuration that exists all three calls go to the same
+        model — concatenating them would produce an unreadable string for no
+        information.
+        """
+        return CostRecord(
+            calls=self.calls + other.calls,
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            cost_eur=self.cost_eur + other.cost_eur,
+            model=self.model or other.model,
+            repair_attempts=self.repair_attempts + other.repair_attempts,
+            requests=self.model_requests + other.model_requests,
+            compliant_requests=(
+                self.compliant_model_requests + other.compliant_model_requests
+            ),
+        )
 
     @classmethod
     def zero(cls) -> CostRecord:

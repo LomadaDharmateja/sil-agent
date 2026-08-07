@@ -42,6 +42,7 @@ from sil_agent.agent.loop import LoopResult, rehydrate, run_loop
 from sil_agent.agent.state import BudgetState, RunState, RunStatus, utcnow
 from sil_agent.eval.metrics import derive_termination
 from sil_agent.persistence.repo import RunRepository
+from sil_agent.services.locks import LockUnavailable, build_lock
 from sil_agent.services.replay import CachingRouter
 from sil_agent.services.router import ModelRouter, build_default_router
 from sil_agent.simulators.toy import ToySimulator
@@ -145,7 +146,10 @@ class CellOutcome:
     """What happened to one cell during this invocation."""
 
     cell: Cell
-    status: str  # "skipped" | "completed"
+    # "skipped"   — already finished, nothing to do
+    # "completed" — this invocation ran it
+    # "locked"    — another worker holds it; see execute_cell
+    status: str
     episodes_run: int
     result: LoopResult | None
 
@@ -190,7 +194,26 @@ def ensure_run(cell: Cell, spec: ExperimentSpec, repo: RunRepository) -> RunStat
 
 
 def execute_cell(cell: Cell, spec: ExperimentSpec, repo: RunRepository) -> CellOutcome:
-    """Run one cell to completion, or skip it if it already finished."""
+    """Run one cell to completion, or skip it if it already finished or is held.
+
+    **Run locking, wired here in Phase 4.** Phase 3 built ``services/locks.py``
+    for exactly this case and connected it only to the CLI's single-run path;
+    Phase 3.5 then hit the case it was built for. A killed shell script left its
+    child ``ablate`` process alive, the command was reissued, and two processes
+    walked the same experiment. Nothing was corrupted — the ``(run_id, idx)``
+    natural key refused the duplicate insert — but the loser had already paid
+    for a simulation and a model call before finding out. At three model calls
+    per ``agent_full`` episode that waste triples.
+
+    So the lock now wraps the loop. It does not replace the natural key: a lock
+    has a TTL and a stalled worker can outlive its lease, whereas a unique index
+    cannot be outlived. The lock removes the waste; the key removes the
+    corruption. Both are load-bearing.
+
+    ``build_lock`` degrades to a ``NullLock`` when ``REDIS_URL`` is unset or
+    Redis is unreachable, so running a benchmark on a laptop with nothing else
+    installed is unchanged.
+    """
     stored = repo.load_run(cell.run_id)
     if stored is not None and derive_termination(stored) is not None:
         return CellOutcome(cell=cell, status="skipped", episodes_run=0, result=None)
@@ -212,7 +235,30 @@ def execute_cell(cell: Cell, spec: ExperimentSpec, repo: RunRepository) -> CellO
         router_factory=_router_factory(cell.run_id, repo, cell.seed),
     )
 
-    result = run_loop(state=state, simulator=simulator, strategy=strategy, repo=repo)
+    lock = build_lock(cell.run_id)
+    try:
+        lock.acquire()
+    except LockUnavailable:
+        # Skipped rather than failed, and never queued behind. A matrix is a
+        # list of independent cells: if another worker has this one, the useful
+        # thing to do is get on with the next. `RunLock.acquire` never blocks,
+        # which is what makes that the cheap option.
+        return CellOutcome(cell=cell, status="locked", episodes_run=0, result=None)
+
+    try:
+        result = run_loop(
+            state=state,
+            simulator=simulator,
+            strategy=strategy,
+            repo=repo,
+            # Extend the lease after each episode rather than choosing a TTL
+            # long enough for the whole run. A fixed long TTL would leave a
+            # crashed run locked for hours; renewing means a dead worker frees
+            # it in two minutes while a live one keeps it indefinitely.
+            heartbeat=lock.renew,
+        )
+    finally:
+        lock.release()
 
     return CellOutcome(
         cell=cell,
@@ -230,11 +276,16 @@ def execute(
 ) -> list[CellOutcome]:
     """Execute every cell of the experiment, in order.
 
-    Sequential on purpose. The simulators are microseconds and the bottleneck is
-    two database round trips per episode, so parallelism would buy a few minutes
-    at the cost of concurrent writers — which the loop does not yet guard
-    against (Redis locking is Phase 3). An ablation that takes twenty minutes
-    and is obviously correct beats one that takes five and needs an argument.
+    Sequential on purpose, and it stayed sequential in Phase 4 even though the
+    locking that made concurrency safe now exists. The reason changed: the
+    bottleneck is no longer two database round trips, it is the model, and the
+    model is one process on one 4 GB card. Running four cells at once would
+    contend for the same GPU rather than using four of them.
+
+    What the lock buys instead is safety against the thing that actually
+    happened — a second *invocation* of the same command while the first is
+    still alive. That is not parallelism anyone designed, it is a reissued
+    command, and Phase 3.5 hit it repeatedly.
     """
     outcomes: list[CellOutcome] = []
     total = spec.total_runs
@@ -246,6 +297,8 @@ def execute(
         if verbose:
             if outcome.status == "skipped":
                 detail = "already complete"
+            elif outcome.status == "locked":
+                detail = "locked by another worker - skipped"
             else:
                 assert outcome.result is not None
                 best = outcome.result.state.best

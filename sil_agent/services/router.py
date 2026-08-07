@@ -290,6 +290,12 @@ class DefaultRouter:
                 # and it is taken here rather than inferred later because this
                 # is the only place that knows how many tries it took.
                 repair_attempts=attempt,
+                # One logical request, however many generations it took. From
+                # Phase 4 an episode aggregates several of these, so the
+                # compliance rate needs a denominator that counts questions
+                # asked rather than provider round trips.
+                requests=1,
+                compliant_requests=1 if attempt == 0 else 0,
             )
             return parsed, cost
 

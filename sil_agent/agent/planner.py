@@ -210,6 +210,56 @@ def describe_best(best: Best | None) -> str:
     )
 
 
+def describe_reflection(history: Sequence[Episode]) -> str:
+    """The previous episode's diagnosis and decision, as the planner sees them.
+
+    **This is the entire mechanism by which reflection reaches the next
+    proposal**, and it reads from ``history`` — that is, out of the episodes
+    table — rather than from anything held on a strategy object. Rule 1 is why:
+    kill the process after episode 7 and resume it, and episode 8's prompt is
+    rebuilt from the database with the reflection still in it. A field on the
+    strategy would have restarted empty and the resumed run would silently have
+    stopped being the run that was interrupted.
+
+    Only the most recent episode is shown. Diagnoses accumulate quickly and the
+    local model runs in a 4096-token context; the older ones are already
+    reflected in where the search has been, which the history block shows.
+    """
+    if not history:
+        return (
+            "No result has been reviewed yet — this is the first proposal. "
+            "Treat this as EXPLORE: sample somewhere that will tell you the most "
+            "about the shape of the space."
+        )
+
+    last = history[-1]
+    evaluation = last.evaluation
+    decision = last.decision
+
+    lines = [
+        f"Direction for this proposal: **{decision.action.value}**",
+    ]
+    if decision.reason:
+        lines.append(f"Why: {decision.reason}")
+    if decision.next_focus:
+        lines.append(f"Concentrate on: {', '.join(decision.next_focus)}")
+
+    lines.append("")
+    lines.append(
+        f"Review of episode {last.idx} "
+        f"({'improved' if evaluation.improved else 'did not improve'}, "
+        f"confidence {evaluation.confidence:.2f}):"
+    )
+    lines.append(evaluation.diagnosis or "(no diagnosis available)")
+
+    if evaluation.hypotheses:
+        lines.append("")
+        lines.append("Hypotheses to test:")
+        lines.extend(f"- {item}" for item in evaluation.hypotheses)
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # The planner
 # ---------------------------------------------------------------------------
@@ -222,6 +272,7 @@ def render_planner_prompt(
     best: Best | None,
     *,
     max_evaluations: int,
+    reflection_block: str = "",
 ) -> tuple[str, str]:
     """Render the exact (system, user) pair the planner sends.
 
@@ -229,6 +280,13 @@ def render_planner_prompt(
     inspect *what the model actually receives*. A test that rebuilt the prompt
     itself would keep passing after this function changed, which is precisely
     the leak it exists to catch.
+
+    ``reflection_block`` is always supplied and only ``planner.v2`` consumes it.
+    ``string.Template.substitute`` ignores values the template does not mention,
+    so v1 renders byte-identically to how it always has — which matters more
+    than it looks: v1 is what ``agent_no_reflection`` uses, it is the control in
+    the Phase 4 experiment, and its recorded Phase 3.5 calls are keyed on a hash
+    of this exact text. One code path, two templates, no drift.
     """
     evaluated = sum(1 for e in history if e.sim_result is not None)
 
@@ -240,6 +298,7 @@ def render_planner_prompt(
         max_evaluations=max_evaluations,
         best_block=describe_best(best),
         history_block=describe_history(history, goal),
+        reflection_block=reflection_block,
     )
     return system, user
 
@@ -258,6 +317,7 @@ class Planner:
         best: Best | None,
         *,
         max_evaluations: int,
+        reflection_block: str = "",
     ) -> tuple[Candidate, CostRecord]:
         """Propose one candidate. Raises LLMOutputError if the model never complies.
 
@@ -267,7 +327,12 @@ class Planner:
         the ablation compare two different pipelines.
         """
         system, user = render_planner_prompt(
-            self._template, goal, history, best, max_evaluations=max_evaluations
+            self._template,
+            goal,
+            history,
+            best,
+            max_evaluations=max_evaluations,
+            reflection_block=reflection_block,
         )
 
         proposal, cost = self._router.complete(

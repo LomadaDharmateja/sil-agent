@@ -276,6 +276,40 @@ def test_the_planner_prompt_never_names_the_benchmark(name):
 
 
 @pytest.mark.parametrize("name", sorted(BENCHMARKS))
+def test_the_critic_and_replanner_prompts_never_name_the_benchmark(name):
+    """Phase 4 added two more prompts, so it added two more places to leak.
+
+    The planner was the only component talking to a model until now. The critic
+    and the replanner render the same objective and parameter space, so an
+    anonymisation checked only on the planner would be checked on a third of the
+    surface. Rendered from the real paths, for the reason above.
+    """
+    from sil_agent.agent.critic import render_critic_prompt
+    from sil_agent.agent.replanner import render_replanner_prompt
+    from sil_agent.agent.state import Candidate, CandidateSource, Evaluation
+
+    simulator = ToySimulator.from_name(name)
+    goal = simulator.default_goal()
+
+    params = {spec.name: sum(spec.bounds) / 2 for spec in goal.parameter_space.params}
+    candidate = Candidate(params=params, rationale="midpoint", source=CandidateSource.PLANNER)
+    outcome = simulator.run(params)
+    computed = Evaluation.computed_only(improved=True, delta_vs_best=1.0, feasible=True)
+
+    critic = render_critic_prompt(
+        load("critic", "v1"), goal, [], candidate, outcome, computed, None
+    )
+    replanner = render_replanner_prompt(
+        load("replanner", "v1"), goal, [], computed, None,
+        evaluations_used=1, max_evaluations=20,
+    )
+
+    text = "\n".join([*critic, *replanner]).lower()
+    for term in FORBIDDEN:
+        assert term not in text, f"{name}: a Phase 4 prompt contains {term!r}"
+
+
+@pytest.mark.parametrize("name", sorted(BENCHMARKS))
 def test_the_goal_never_names_the_benchmark(name):
     """Belt and braces: the goal is persisted and reaches other prompts too."""
     goal = ToySimulator.from_name(name).default_goal()

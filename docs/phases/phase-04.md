@@ -3,9 +3,14 @@
 Built 2026-08-07. The experiment the project exists to run.
 
 **The answer is no.** On these two benchmarks, at twenty evaluations, with a
-local 4B model, reflection did not pay — and on `branin_i1` it did measurable
-harm. That is the result, it was measured honestly, and this log is mostly about
-how it was measured and what else fell over on the way.
+local 4B model, reflection did not pay. The reflecting agent's mean regret on
+`branin_i1` is 7.10 against the planner-only control's 0.33, for 3.8× the
+tokens — though a third arm shows that about half of that degradation comes from
+the reworded prompt rather than from reflection itself, and no single step
+clears significance at five seeds.
+
+That is the result, it was measured honestly, and this log is mostly about how it
+was measured and what else fell over on the way.
 
 ## 1. Why this phase exists
 
@@ -182,11 +187,19 @@ the model was invited to send — instead of a fact about the schema.
 
 ## 5. What went wrong
 
-**The headline is a negative result.** Reflection did not help. On `branin_i1` it
-was worse than the control on every summary statistic; on `hartmann6_i1` there is
-no difference worth reporting (p=0.84). The full numbers are below. The brief
-predicted this as expected-failure #2 and #6, which is the only reason it is not
-a surprise.
+**The headline is a negative result.** Reflection did not help. On `branin_i1`
+the reflecting arm was worse than the control on every summary statistic; on
+`hartmann6_i1` there is no difference worth reporting. The brief predicted this
+as expected-failure #2 and #6, which is the only reason it is not a surprise.
+
+**And the confound arm changed what the negative result means.** The brief
+flagged that `agent_full` differs from the control in two ways — reflection
+content *and* prompt wording — and specified a third arm to separate them. I had
+already written "reflection made it worse" in my notes before that arm finished.
+It ran, and about half the `branin_i1` degradation turns out to be present in the
+reworded prompt with no reflection content at all (mean 0.33 → 1.67 → 7.10). The
+two-arm comparison would have attributed all of it to reflection. That arm cost
+200 model calls and was the highest-value thing in the phase.
 
 **I nearly reported a reproducibility success that was a coincidence.** The
 phase re-runs `agent_no_reflection` under a new experiment name, which gets new
@@ -227,13 +240,35 @@ stored text. The reproducibility this project actually has comes from the audit
 trail built in Phase 3, not from pinning the model. That is a narrower claim and
 a true one.
 
-The likely mechanism is that the model does not fit the 4 GB card — inference
-runs 36%/64% CPU/GPU — so reduction order across the split is not guaranteed
-stable between loads, and a near-tie in the logits occasionally flips. Once one
-token differs the trajectory forks irrecoverably. `tests/test_determinism.py`
-separates within-process from across-process determinism so the next person does
-not have to re-derive this; it is marked `live` and deselected, like the
-memorisation comparison, because a mocked model cannot answer the question.
+My first explanation was that the model does not fit the 4 GB card — inference
+runs 36%/64% CPU/GPU — so reduction order across the split drifts between loads.
+That was a guess, and this project has a rule about those, so I measured it.
+`tests/test_determinism.py` issues one short request twice in-process, and again
+from a fresh interpreter:
+
+| Condition | Reproduced? |
+|---|---|
+| Same seed, twice in one process | **yes** |
+| Same seed, separate process, model reloaded | **yes** |
+
+**Both pass.** The seed is genuinely wired, and an isolated request is
+deterministic across a reload on exactly the hardware that produced 1-in-10
+above. So the simple explanation is wrong, and the two obvious suspects — an
+unseeded sampler, and a hardware reload — are both ruled out.
+
+What is left is *sequence*. A cell is twenty sequential calls sharing long
+prefixes, issued into a server session that had already processed hundreds of
+requests from earlier cells. Ollama reuses KV cache across requests, so how much
+of a prompt is recomputed rather than reused depends on what preceded it —
+which makes a generation a function of the request *and its history on that
+server*, not the request alone. Two runs that reach a byte-identical prompt by
+different routes need not produce identical output from it, and the first
+divergence in eight of ten cells was at episode 1, 2 or 3, before histories had
+had time to differ much.
+
+Stated as the surviving hypothesis rather than a result: I have ruled out two
+explanations and not confirmed a third. What is *measured* is the 1-in-10, and
+that is enough to retire the design claim.
 
 **The critic's confidence is a constant.** Across 200 reflected episodes:
 
@@ -332,6 +367,10 @@ That points somewhere specific rather than "try harder":
 - The replanner chose EXPLOIT 109 times of 200 and EXPLORE 70. The prompt tells
   it to prefer EXPLORE early, and it does not. Prompt A/B testing (Phase 11) has
   a concrete first hypothesis, and the harness to test it.
+- The prompt control makes that hypothesis sharper: v2's directive sixth rule
+  degrades `branin_i1` on its own, before any reflection exists. The first A/B to
+  run is v2 with that rule softened from "follow it unless the results plainly
+  contradict it" to something advisory.
 - `DiversityCollapse` needs re-tuning against a real trajectory, now that one
   exists. `epsilon=0.02` is too tight by roughly a factor of three.
 - `confidence` is inert at 4B and should not be built on until a stronger model
@@ -351,8 +390,11 @@ That points somewhere specific rather than "try harder":
 | Model | `qwen3:4b-q4_K_M`, pinned including quantisation |
 | GPU residency | 3.6 GB, **36% / 64% CPU/GPU**, `num_ctx` 4096 |
 | Model calls in `phase4-main` | **810** (600 agent_full + 200 agent_no_reflection + 10 single-shot) |
+| Model calls in `phase4-control` | 200 |
 | Schema compliance | **100%** (810/810 first try, zero repairs) |
 | Reflection failures | **0** |
+| Exact trajectory reproduction, re-executed at the same seed | **1 / 10** |
+| Isolated request reproduced across a process restart | yes (measured) |
 | Worst-case prompt | 1,051 tokens of 4,096 (replanner, 6-D, full history) |
 | LLM spend | **€0.00** |
 
@@ -395,6 +437,53 @@ rank test says "no demonstrated difference in the typical case" and is right. Th
 spread says "this version can fail badly and the other one cannot", which at n=5
 is an observation rather than a claim, and is the one I would act on.
 
+### Was it the reflection, or the prompt that carries it? Partly the prompt.
+
+`agent_full` differs from the control in *two* ways — reflection content, and
+`planner.v2`'s wording. `agent_prompt_control` (experiment `phase4-control`)
+holds the prompt at v2 and removes only the content, which splits the difference
+into two steps:
+
+**branin_i1**
+
+| Arm | Prompt | Reflection | mean | sd | median |
+|---|---|---|---|---|---|
+| `agent_no_reflection` | v1 | no | **0.331** | 0.19 | 0.386 |
+| `agent_prompt_control` | v2 | no | 1.666 | 2.49 | 0.507 |
+| `agent_full` | v2 | yes | 7.104 | 9.25 | 0.507 |
+
+**hartmann6_i1**
+
+| Arm | mean | sd | median |
+|---|---|---|---|
+| `agent_no_reflection` | 0.944 | 0.43 | 0.714 |
+| `agent_prompt_control` | 0.966 | 0.63 | 0.820 |
+| `agent_full` | 1.048 | 0.56 | 0.729 |
+
+| Step | branin_i1 | hartmann6_i1 |
+|---|---|---|
+| Prompt effect (v1 → v2, both unreflected) | p=0.1508 | p=0.8413 |
+| Reflection effect (v2 → v2 + reflection) | p=0.6905 | p=1.0000 |
+
+**Neither step is significant at n=5, and the arm changed the conclusion
+anyway.** On `branin_i1`, about half the degradation in the mean is already
+present *before any reflection content exists* — the reworded prompt alone takes
+the mean from 0.33 to 1.67. Without this arm I would have attributed all of it to
+reflection, which is what the two-arm comparison invites and what I had written
+down before running it.
+
+The robust signal across all three arms is not the mean but the **spread**, which
+escalates monotonically at both steps: sd 0.19 → 2.49 → 9.25. Both changes add
+variance, and reflection adds more of it than the rewording does. On
+`hartmann6_i1` nothing moves at all.
+
+The plausible mechanism is that v2's sixth rule — *"the review section states a
+direction […] follow it unless the results plainly contradict it"* — is
+directive, and a 4B model reads directive instructions literally. It commits to a
+mode even when the review block, in the control, explicitly says no review is
+available. Testing that is prompt A/B work, which is Phase 11 and now has its
+first concrete hypothesis.
+
 ### What reflection cost
 
 | Strategy | Model requests | Requests per evaluation | Prompt tokens | Completion tokens |
@@ -434,13 +523,22 @@ hill-climber, and at twenty evaluations a hill-climber from a bad start loses to
 space-filling. Reflection did not lower the typical result; it added a failure
 mode.
 
-I also caught myself nearly publishing a false positive in the same phase. Re-running
-the control under a new experiment name reproduced Phase 3.5's regret to sixteen
-digits, which I recorded as confirming the reproducibility claim. It did not:
-the trajectories diverged at episode 1 and converged on the same answer because
-language models propose round numbers. Checking properly, **1 of 10 runs
-reproduced exactly and 3 of 10 matched on final score** — so the score agreement
-overstated reproduction threefold, and my design document's headline reason for
-running locally is wrong on this hardware. What actually delivers reproducibility
-is the recorded-call audit trail, not the pinned model: replay is exact,
+Two things in the same phase kept me honest about my own numbers. The confound
+arm is one: I had written "reflection made it worse" before the control finished,
+and the control showed half the damage was already in the reworded prompt with no
+reflection in it.
+
+The other is a false positive I nearly published. Re-running the control under a
+new experiment name reproduced Phase 3.5's regret to sixteen digits, which I
+recorded as confirming my design document's reproducibility claim. It did not:
+those trajectories diverged at episode 1 and converged on the same answer because
+language models propose round numbers. Checked properly, **1 of 10 runs
+reproduced exactly and 3 of 10 matched on final score** — score agreement
+overstated reproduction threefold. I then guessed the cause was the model not
+fitting the GPU, measured that too, and was wrong again: an isolated request at a
+fixed seed reproduces perfectly across a process restart on that same hardware.
+So the claim that a pinned local model "reruns byte-identically" is retired, the
+mechanism is narrowed to prompt-cache reuse across a long request sequence and
+labelled a hypothesis, and what actually delivers reproducibility turns out to be
+the recorded-call audit trail rather than the pinned model: replay is exact,
 re-execution is not.

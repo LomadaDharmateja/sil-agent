@@ -34,8 +34,17 @@ and only one of them threatens the design claim:
   on a card the model does not fit, the batch shape, the kernel scheduling —
   changes the arithmetic underneath it.
 
-The second is the one that matters for "reruns byte-identically in two years",
-and it is the one that fails.
+Measured on the Phase 4 machine, **both pass**: an isolated request at a fixed
+seed reproduces, in-process and across processes. Which is the interesting part,
+because the real runs did *not* — 1 of 10 twenty-episode runs reproduced its
+trajectory when re-executed at the same seed.
+
+So the seed is wired, the model is deterministic in isolation, and
+reproducibility is nonetheless lost somewhere between here and a real run. These
+two tests are what narrows that gap: they rule out the two simple explanations
+and leave the difference to be about *sequence* — hundreds of requests sharing
+prefixes through one server session, where prompt-cache reuse makes a generation
+depend on what was processed before it. See `docs/phases/phase-04.md` §5.
 """
 
 from __future__ import annotations

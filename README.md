@@ -140,8 +140,12 @@ assumed (lowering it makes TPE *worse*). Details in the
 
 ## Stack
 
-Python 3.12 · Pydantic v2 · Postgres · Redis · FastAPI · Optuna · Ollama · OpenTelemetry · Langfuse · Docker
+Python 3.12 · Pydantic v2 · SQLAlchemy + Alembic · PostgreSQL · Redis (run locks) ·
+Optuna · SciPy · httpx · Ollama · Docker Compose · pytest, ruff, mypy
 
-The agent runs on a **local** `qwen3:4b-q4_K_M` through Ollama — no API key, no
-quota, and a pinned model that reruns byte-identically in two years, which no
-hosted API can promise. Hosted providers remain wired in as failover.
+The agent runs on a **local** `qwen3:4b-q4_K_M` through Ollama, seeded: no API
+key, no quota, and the model version is pinned. Hosted providers are wired in as
+failover through the same router.
+
+Planned for Phase 6 and not built yet: FastAPI service, OpenTelemetry and
+Langfuse tracing, MCP.

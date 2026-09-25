@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The database tests prove Postgres behaviour (JSONB round-trips,
+    # ON CONFLICT on a composite key), so CI gives them a real Postgres
+    # instead of letting them skip.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sil
+          POSTGRES_PASSWORD: sil
+          POSTGRES_DB: sil_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sil -d sil_agent_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://sil:sil@localhost:5432/sil_agent_test
+      ALEMBIC_DATABASE_URL: postgresql+psycopg://sil:sil@localhost:5432/sil_agent_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install from the lockfile
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Type check
+        run: uv run --frozen mypy sil_agent
+
+      - name: Migrate the test database
+        run: uv run --frozen alembic upgrade head
+
+      # Live-model tests are deselected by pyproject's addopts; everything
+      # else runs offline.
+      - name: Tests
+        run: uv run --frozen pytest -ra --junitxml=report.xml
+
+      # With Postgres available no database test should skip. A skip here
+      # means those tests silently stopped running. (Other skips are
+      # deliberate, e.g. the full grid check on high-dimensional cases.)
+      - name: No database test may skip in CI
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("report.xml").getroot()
+          db_skips = [
+              case.get("classname") + "::" + case.get("name")
+              for case in root.iter("testcase")
+              for skip in case.findall("skipped")
+              if "database" in (skip.get("message") or "")
+          ]
+          for name in db_skips:
+              print("skipped:", name)
+          print(f"{len(db_skips)} database tests skipped")
+          sys.exit(1 if db_skips else 0)
+          PY

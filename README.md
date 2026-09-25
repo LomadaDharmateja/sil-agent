@@ -32,6 +32,30 @@ Under construction. See `docs/phases/` for the build log.
 | 7–10 — Surrogate, Pareto, vehicle sim, distillation | not started |
 | 11–12 — Prompt versioning, HITL, write-up | not started |
 
+## Architecture
+
+```mermaid
+flowchart LR
+    goal["Goal + parameter space<br/>declared by the simulator"] --> planner
+
+    subgraph episode["One episode: a pure function of persisted state"]
+        planner["Planner (LLM)<br/>via services/router.py"] --> guards["Guards<br/>schema check, clamp,<br/>duplicate perturbation"]
+        guards --> sim["Simulator<br/>shifted + rotated benchmark"]
+        sim --> score["Deterministic scoring<br/>improved, delta_vs_best, feasible"]
+    end
+
+    score --> db[("PostgreSQL<br/>runs, episodes, llm_calls")]
+    db -- "rehydrate next episode" --> planner
+    baselines["Baselines<br/>random, grid, Optuna TPE"] --> sim
+    db --> harness["Eval harness<br/>regret, seeds, rank tests,<br/>reports/"]
+    provider["Ollama, local qwen3:4b<br/>hosted providers as failover"] --- planner
+    locks[("Redis<br/>run locks")] -.- episode
+```
+
+The LLM only proposes. Everything that decides whether a candidate was good is
+deterministic code, and every episode is rebuilt from the database, so an
+interrupted run resumes exactly where it stopped.
+
 ## The baseline to beat
 
 Phases 1–2 contain no LLM code. The measurement harness exists before the agent,
@@ -129,6 +153,40 @@ there**; and Optuna's `n_startup_trials` is 10, so at a 20-evaluation budget hal
 of TPE's run is random sampling — stated in the report, and measured rather than
 assumed (lowering it makes TPE *worse*). Details in the
 [Phase 3.5 log](docs/phases/phase-035.md).
+
+## Quickstart
+
+Python 3.12 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+uv sync                        # installs the exact versions in uv.lock
+uv run pytest                  # 306 tests collected; see below
+```
+
+On a clean clone with no services running, **277 pass and 29 skip**: 27 need
+Postgres, 2 skip a full-grid check by design. Two live-model tests are
+deselected by default (`uv run pytest -m live` runs them).
+
+With Postgres and Redis, the database tests run too and experiments can be
+stored:
+
+```bash
+cp .env.example .env
+docker compose up -d                                   # Postgres 16 + Redis 7
+uv run alembic upgrade head                            # development database
+ALEMBIC_DATABASE_URL=postgresql+psycopg://sil:sil@localhost:5432/sil_agent_test \
+    uv run alembic upgrade head                        # test database
+uv run pytest                                          # database tests now run
+
+# Baselines only, no LLM: the Phase 2 table above
+uv run python -m sil_agent.cli ablate --experiment phase2-main --seeds 5 --episodes 200
+```
+
+The agent strategies (`agent_no_reflection`, `single_shot_llm`) need a model:
+`ollama pull qwen3:4b-q4_K_M`, then pass them to `--strategies`.
+
+CI runs ruff, mypy, the migrations and the full suite against a Postgres
+service, and fails if any database test skips.
 
 ## Documentation
 

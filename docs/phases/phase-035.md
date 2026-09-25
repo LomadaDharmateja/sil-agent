@@ -288,7 +288,7 @@ exists, `rehydrate` recomputes position from the episodes table, and the natural
 key makes a re-issued command a no-op over the parts already done. The only thing
 I had to get right was not starting a second writer.
 
-**The live tests ran by default and broke the offline rule.** `CLAUDE.md`
+**The live tests ran by default and broke the offline rule.** `CONTRIBUTING.md`
 requires LLM calls to be mocked, and the memorisation comparison is the one thing
 that genuinely cannot be — a mocked model proves nothing about what a real one
 memorised. Written as a normal test, it ran whenever Ollama happened to be

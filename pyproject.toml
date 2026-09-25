@@ -96,7 +96,7 @@ markers = [
     "db: test requires a reachable Postgres (TEST_DATABASE_URL)",
     "live: test calls a real model; excluded by default (run with `-m live`)",
 ]
-# `CLAUDE.md`: LLM calls are mocked in tests. The memorisation comparison is the
+# `CONTRIBUTING.md`: LLM calls are mocked in tests. The memorisation comparison is the
 # one thing that genuinely cannot be — a mocked model proves nothing about what
 # a real one has memorised — so it is written as a test and then deselected, so
 # the default suite stays offline, fast and deterministic. Run it deliberately:

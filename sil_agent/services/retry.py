@@ -1,6 +1,6 @@
 """Retry with jittered exponential backoff.
 
-``CLAUDE.md`` calls this mandatory rather than optional, and the arithmetic says
+``CONTRIBUTING.md`` calls this mandatory rather than optional, and the arithmetic says
 why: free tiers allow 10-15 requests per minute, and a planner-only agent makes
 one call per episode with no natural pause between them. A 50-episode run will
 meet HTTP 429 repeatedly. Without backoff the run does not slow down, it fails.

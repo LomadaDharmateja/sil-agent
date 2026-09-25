@@ -3,7 +3,7 @@
 Ollama is the primary from Phase 3.5, and unlike the hosted adapters it carries
 real logic: it constrains decoding against a schema, budgets the context window,
 and detects two kinds of truncation. All of that is tested here against a mock
-transport — no server, no model, no network, per `CLAUDE.md`.
+transport — no server, no model, no network, per `CONTRIBUTING.md`.
 
 The context tests matter most. Ollama truncates an over-long prompt *silently*,
 so a run with an oversized prompt does not fail; it produces plausible numbers

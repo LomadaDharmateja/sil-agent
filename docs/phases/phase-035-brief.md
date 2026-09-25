@@ -209,7 +209,7 @@ own.
 ### The test the request calls the real deliverable
 
 *"The single-shot control no longer lands on the optimum before seeing any
-result."* That cannot be a normal unit test — `CLAUDE.md` requires LLM calls to
+result."* That cannot be a normal unit test — `CONTRIBUTING.md` requires LLM calls to
 be mocked, and a mocked model proves nothing about memorisation. So it splits:
 
 - **A deterministic unit test**, always run: for each instance, assert the

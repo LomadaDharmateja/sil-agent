@@ -98,7 +98,7 @@ class ModelRouter(Protocol):
                  schema: type[BaseModel]) -> tuple[BaseModel, CostRecord]: ...
 ```
 
-`CLAUDE.md` is absolute here: **no agent code imports a provider SDK.** The router is
+`CONTRIBUTING.md` is absolute here: **no agent code imports a provider SDK.** The router is
 what makes "switch providers" a config change, and it is why Phase 10 can drop in a
 local model without touching the planner.
 
@@ -111,7 +111,7 @@ exist this phase; define the rest of the enum now so the mapping is stable.
 Start with **two**, not five: one workhorse and one fallback, so the fallback path is
 exercised from the beginning rather than written blind in Phase 6.
 
-Every adapter needs **jittered exponential backoff on HTTP 429**. `CLAUDE.md` calls it
+Every adapter needs **jittered exponential backoff on HTTP 429**. `CONTRIBUTING.md` calls it
 mandatory, and at 15 RPM an agent loop hits it constantly.
 
 Two details that turn a retry loop from decorative into correct:
@@ -202,7 +202,7 @@ governor stays in Phase 6; this is the measurement it will later enforce against
 
 ### 10. Tests — all mocked, no network, no key
 
-Non-negotiable per `CLAUDE.md`. The suite must stay runnable offline and in CI.
+Non-negotiable per `CONTRIBUTING.md`. The suite must stay runnable offline and in CI.
 
 - Backoff: 429 → retry with growing, jittered delays; `Retry-After` honoured; give up
   after the cap; a 429 never surfaces as an episode

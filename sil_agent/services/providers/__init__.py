@@ -1,6 +1,6 @@
 """Provider adapters — the only code in the project that speaks HTTP to an LLM.
 
-``CLAUDE.md``: *All access goes through `services/router.py`. Never call a
+``CONTRIBUTING.md``: *All access goes through `services/router.py`. Never call a
 provider SDK directly from agent code.* This package is what the router calls,
 and nothing above the router imports it.
 

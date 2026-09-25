@@ -13,7 +13,7 @@ a property of the *problem* and partly a fact about the *model*.
 the instance optimum is not derivable from anything in the prompt.
 
 **The live half** measures the model, and is skipped unless Ollama is actually
-reachable — `CLAUDE.md` requires the suite to run offline with no key. It is the
+reachable — `CONTRIBUTING.md` requires the suite to run offline with no key. It is the
 comparison that carries the evidence: the same strategy, the same budget, the
 same anonymised prompt, run on the original benchmark and on the shifted
 instance. Only the *gap* between them says anything. A good score on the

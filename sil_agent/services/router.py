@@ -1,6 +1,6 @@
 """The model router — the only door to a provider.
 
-``CLAUDE.md`` is absolute: *all access goes through `services/router.py`. Never
+``CONTRIBUTING.md`` is absolute: *all access goes through `services/router.py`. Never
 call a provider SDK directly from agent code.* Everything above this file asks
 for "a completion for the PLANNER role, shaped like this schema" and receives a
 validated Pydantic object. It never learns which provider answered, how many

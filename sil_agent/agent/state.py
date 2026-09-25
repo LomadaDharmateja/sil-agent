@@ -4,7 +4,7 @@ Every model here is a Pydantic v2 model with two settings applied throughout:
 
 ``frozen=True``
     Instances cannot be mutated after construction. To "change" a run you build
-    a new one. This enforces Rule 1 from ``CLAUDE.md`` mechanically: if nothing
+    a new one. This enforces Rule 1 from ``CONTRIBUTING.md`` mechanically: if nothing
     can be quietly mutated in memory, the only way state moves forward is
     through something that gets persisted.
 
